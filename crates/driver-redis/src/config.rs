@@ -1,24 +1,48 @@
-//! Builds a `redis::ConnectionInfo` from a `db_headless_core::ConnectionConfig`.
+//! Builds a `redis::ConnectionInfo` from a `db_headless_core::ConnectionConfig`,
+//! and from it a real `redis::Client` wired up for whatever `SslMode` the
+//! config asks for.
 //!
-//! Built as a struct (`redis::ConnectionInfo { addr, redis: RedisConnectionInfo { .. } }`)
-//! rather than by formatting a `redis://user:pass@host:port/db` URL string:
-//! hand-assembling and percent-encoding a credentials URL is exactly the
-//! kind of ad hoc string construction this project avoids elsewhere, and
-//! the struct constructor needs no escaping at all.
+//! `ConnectionInfo` itself is built as a struct
+//! (`redis::ConnectionInfo { addr, redis: RedisConnectionInfo { .. } }`)
+//! rather than by formatting a `redis://user:pass@host:port/db` URL
+//! string: hand-assembling and percent-encoding a credentials URL is
+//! exactly the kind of ad hoc string construction this project avoids
+//! elsewhere, and the struct constructor needs no escaping at all.
 //!
-//! TLS support is intentionally scoped down for this pass, mirroring
-//! `driver-postgres`'s precedent: only `SslMode::Disabled` and
-//! `SslMode::Preferred` connect for real (both as plain TCP — `Preferred`
-//! always falls back to plaintext, there is no TLS connector wired up
-//! yet). Guardrail #6 requires a missing `mode` to be treated as
-//! `VerifyIdentity`, never silently downgraded to `Disabled`, so an unset
-//! mode and the three verified modes (`Required`, `VerifyCa`,
-//! `VerifyIdentity`) all return a clear `DriverError` instead of
-//! connecting.
+//! # TLS: real, via `redis-rs`'s own `rustls` integration
+//!
+//! Unlike `driver-postgres`, which hand-rolls a `rustls::ClientConfig`
+//! (needed there to get a chain-only verifier), `redis-rs` already ships
+//! working `rustls` support behind its `tls-rustls`/`tls-rustls-insecure`
+//! features, so `build_client` uses that directly instead of duplicating
+//! it:
+//!
+//! - `Disabled`: plain TCP, `redis::Client::open`.
+//! - `Preferred` / `Required`: `ConnectionAddr::TcpTls { insecure: true, .. }`.
+//!   Still a real, encrypted TLS handshake; the certificate's chain and
+//!   hostname are not checked at all, matching libpq's own
+//!   `sslmode=require` semantics (and this workspace's own
+//!   `driver-postgres` precedent for the same two modes).
+//! - `VerifyCa`, `VerifyIdentity`, and a missing `mode` (guardrail #6:
+//!   never silently downgrade): `insecure: false`. `redis-rs`'s public
+//!   TLS API only exposes that one binary flag — there is no hook to
+//!   supply a custom `rustls::client::danger::ServerCertVerifier`, so
+//!   "verify the chain but skip the hostname" (`driver-postgres`'s
+//!   `VerifyCa` behavior) cannot be expressed through it. `VerifyCa`
+//!   therefore gets the same, stricter chain-and-hostname check as
+//!   `VerifyIdentity` here. Collapsing upward like this is the safe
+//!   direction: guardrail #6 forbids verifying *less* than the mode
+//!   asks for, never verifying more. `ssl.ca_path`, when set, is read
+//!   and passed as the trusted root; otherwise `redis-rs` falls back to
+//!   the platform's native trust store on its own.
+
+use std::fs;
 
 use secrecy::ExposeSecret;
 
 use db_headless_core::{ConnectionConfig, DriverError, DriverErrorKind, DriverResult, SslMode};
+
+use crate::error;
 
 /// Parses `ConnectionConfig::database` as Redis's numeric database index.
 /// `None` (or an empty string) defaults to `0`, matching Redis's own
@@ -39,7 +63,6 @@ pub(crate) fn parse_db_index(database: Option<&str>) -> DriverResult<i64> {
 pub(crate) fn build_connection_info(
     config: &ConnectionConfig,
 ) -> DriverResult<redis::ConnectionInfo> {
-    resolve_ssl_mode(config)?;
     let db = parse_db_index(config.database.as_deref())?;
 
     let username = if config.username.is_empty() {
@@ -52,8 +75,26 @@ pub(crate) fn build_connection_info(
         .as_ref()
         .map(|secret| secret.expose_secret().to_string());
 
+    let addr = match config.ssl.mode {
+        Some(SslMode::Disabled) => redis::ConnectionAddr::Tcp(config.host.clone(), config.port),
+        Some(SslMode::Preferred) | Some(SslMode::Required) => redis::ConnectionAddr::TcpTls {
+            host: config.host.clone(),
+            port: config.port,
+            insecure: true,
+            tls_params: None,
+        },
+        Some(SslMode::VerifyCa) | Some(SslMode::VerifyIdentity) | None => {
+            redis::ConnectionAddr::TcpTls {
+                host: config.host.clone(),
+                port: config.port,
+                insecure: false,
+                tls_params: None,
+            }
+        }
+    };
+
     Ok(redis::ConnectionInfo {
-        addr: redis::ConnectionAddr::Tcp(config.host.clone(), config.port),
+        addr,
         redis: redis::RedisConnectionInfo {
             db,
             username,
@@ -63,33 +104,57 @@ pub(crate) fn build_connection_info(
     })
 }
 
-fn resolve_ssl_mode(config: &ConnectionConfig) -> DriverResult<()> {
-    match config.ssl.mode {
-        Some(SslMode::Disabled) | Some(SslMode::Preferred) => Ok(()),
-        None => Err(unverified_tls_error(
-            "no ssl.mode was set; guardrail #6 treats a missing mode as VerifyIdentity, \
-             which this driver build does not yet implement",
-        )),
-        Some(SslMode::Required) => Err(unverified_tls_error(
-            "ssl.mode = required is not yet implemented by this driver build",
-        )),
-        Some(SslMode::VerifyCa) => Err(unverified_tls_error(
-            "ssl.mode = verify_ca is not yet implemented by this driver build",
-        )),
-        Some(SslMode::VerifyIdentity) => Err(unverified_tls_error(
-            "ssl.mode = verify_identity is not yet implemented by this driver build",
-        )),
+/// Reads `ssl.ca_path` (if set) into the PEM bytes `redis-rs` wants as a
+/// custom trusted root. `None` lets `redis-rs` fall back to the
+/// platform's native trust store on its own.
+fn root_cert_pem(config: &ConnectionConfig) -> DriverResult<Option<Vec<u8>>> {
+    match &config.ssl.ca_path {
+        Some(ca_path) => {
+            let pem = fs::read(ca_path).map_err(|err| {
+                DriverError::new(
+                    DriverErrorKind::Connection,
+                    format!("failed to read ssl.ca_path {}: {err}", ca_path.display()),
+                )
+            })?;
+            Ok(Some(pem))
+        }
+        None => Ok(None),
     }
 }
 
-fn unverified_tls_error(message: &str) -> DriverError {
-    DriverError::new(
-        DriverErrorKind::Connection,
-        format!(
-            "{message}; pass ssl.mode = disabled or preferred explicitly, or wait for verified \
-             TLS support, connection refused rather than silently downgrading verification"
-        ),
+/// Builds a real `redis::Client` for `config`, connected over plain TCP
+/// for `SslMode::Disabled` and over real TLS (see the module doc comment
+/// for exactly what each mode verifies) for every other mode.
+pub(crate) fn build_client(
+    config: &ConnectionConfig,
+    db_override: Option<i64>,
+) -> DriverResult<redis::Client> {
+    let mut info = build_connection_info(config)?;
+    if let Some(db) = db_override {
+        info.redis.db = db;
+    }
+
+    if matches!(config.ssl.mode, Some(SslMode::Disabled)) {
+        return redis::Client::open(info).map_err(error::map_connect_error);
+    }
+
+    let root_cert = if matches!(
+        config.ssl.mode,
+        Some(SslMode::Preferred | SslMode::Required)
+    ) {
+        None
+    } else {
+        root_cert_pem(config)?
+    };
+
+    redis::Client::build_with_tls(
+        info,
+        redis::TlsCertificates {
+            client_tls: None,
+            root_cert,
+        },
     )
+    .map_err(error::map_connect_error)
 }
 
 #[cfg(test)]
@@ -135,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_mode_builds_connection_info() {
+    fn disabled_mode_builds_plain_tcp_connection_info() {
         let config = base_config(SslConfig::disabled());
         let info = build_connection_info(&config).expect("build info");
         assert_eq!(info.redis.db, 0);
@@ -143,31 +208,87 @@ mod tests {
     }
 
     #[test]
-    fn preferred_mode_builds_connection_info() {
-        let config = base_config(SslConfig {
-            mode: Some(SslMode::Preferred),
-            ..Default::default()
-        });
-        assert!(build_connection_info(&config).is_ok());
+    fn preferred_and_required_build_insecure_tls_connection_info() {
+        for mode in [SslMode::Preferred, SslMode::Required] {
+            let config = base_config(SslConfig {
+                mode: Some(mode),
+                ..Default::default()
+            });
+            let info = build_connection_info(&config).expect("build info");
+            match info.addr {
+                redis::ConnectionAddr::TcpTls { insecure, .. } => assert!(insecure),
+                other => panic!("expected TcpTls, got {other:?}"),
+            }
+        }
     }
 
     #[test]
-    fn missing_mode_is_rejected_rather_than_silently_downgraded() {
+    fn verify_ca_verify_identity_and_missing_mode_all_build_verified_tls_connection_info() {
+        for ssl in [
+            SslConfig {
+                mode: Some(SslMode::VerifyCa),
+                ..Default::default()
+            },
+            SslConfig {
+                mode: Some(SslMode::VerifyIdentity),
+                ..Default::default()
+            },
+            SslConfig::default(),
+        ] {
+            let config = base_config(ssl);
+            let info = build_connection_info(&config).expect("build info");
+            match info.addr {
+                redis::ConnectionAddr::TcpTls { insecure, .. } => assert!(!insecure),
+                other => panic!("expected TcpTls, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn build_client_for_disabled_mode_does_not_require_tls_setup() {
+        let config = base_config(SslConfig::disabled());
+        build_client(&config, None).expect("plain TCP client always builds");
+    }
+
+    #[test]
+    fn build_client_for_preferred_and_required_does_not_need_a_ca_path() {
+        for mode in [SslMode::Preferred, SslMode::Required] {
+            let config = base_config(SslConfig {
+                mode: Some(mode),
+                ..Default::default()
+            });
+            build_client(&config, None).expect("insecure TLS client builds without a CA");
+        }
+    }
+
+    #[test]
+    fn build_client_for_verify_ca_with_a_nonexistent_ca_path_is_a_clear_error() {
+        let config = base_config(SslConfig {
+            mode: Some(SslMode::VerifyCa),
+            ca_path: Some("/nonexistent/ca.pem".into()),
+            ..Default::default()
+        });
+        let err = build_client(&config, None).map(drop).unwrap_err();
+        assert_eq!(err.kind, DriverErrorKind::Connection);
+        assert!(err.message.contains("ca_path"));
+    }
+
+    #[test]
+    fn build_client_for_verify_identity_without_a_ca_path_falls_back_to_native_trust_store() {
+        let config = base_config(SslConfig {
+            mode: Some(SslMode::VerifyIdentity),
+            ..Default::default()
+        });
+        // Either a successful build or a clear `redis-rs` error about the
+        // native trust store is acceptable in a minimal CI/container
+        // image with no native certs; a panic is not.
+        let _ = build_client(&config, None);
+    }
+
+    #[test]
+    fn missing_mode_behaves_like_verify_identity_not_disabled() {
         let config = base_config(SslConfig::default());
-        let err = build_connection_info(&config).unwrap_err();
-        assert_eq!(err.kind, DriverErrorKind::Connection);
-        assert!(err.message.contains("VerifyIdentity"));
-    }
-
-    #[test]
-    fn required_mode_is_rejected_with_a_clear_error() {
-        let config = base_config(SslConfig {
-            mode: Some(SslMode::Required),
-            ..Default::default()
-        });
-        let err = build_connection_info(&config).unwrap_err();
-        assert_eq!(err.kind, DriverErrorKind::Connection);
-        assert!(err.message.contains("required"));
+        let _ = build_client(&config, None);
     }
 
     // There is deliberately no

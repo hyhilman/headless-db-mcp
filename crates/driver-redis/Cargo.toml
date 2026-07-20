@@ -8,7 +8,7 @@ description = "Redis DatabaseDriver implementation via redis-rs."
 
 [dependencies]
 db-headless-core = { path = "../core" }
-redis.workspace = true
+redis = { workspace = true, features = ["tokio-rustls-comp", "tls-rustls-insecure"] }
 tokio.workspace = true
 async-trait.workspace = true
 futures-core.workspace = true
@@ -22,3 +22,5 @@ futures-util = "0.3"
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["redis"] }
 tokio = { workspace = true, features = ["full"] }
+rcgen = "0.14.8"
+tempfile = "3.27.0"

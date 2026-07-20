@@ -10,17 +10,20 @@
 //! client-side, was only added in Redis 6.0.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::time::Duration;
 
 use db_headless_core::{
     CellValue, ConnectionConfig, CreateDatabaseRequest, DatabaseDriver, DriverErrorKind, SslConfig,
-    StreamElement,
+    SslMode, StreamElement,
 };
 use db_headless_driver_redis::RedisDriver;
 use futures_util::StreamExt;
 use testcontainers_modules::redis::Redis;
+use testcontainers_modules::testcontainers::core::wait::LogWaitStrategy;
+use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
+use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 const REDIS_TAG: &str = "7.2";
 const REDIS_PASSWORD: &str = "real-s3cret-value";
@@ -404,4 +407,199 @@ async fn cancel_query_interrupts_a_long_running_blocking_command() {
         elapsed < Duration::from_secs(20),
         "cancellation should interrupt the blocking command well before its natural 30s completion, took {elapsed:?}"
     );
+}
+
+const REDIS_TLS_PORT: u16 = 6380;
+
+/// Generates a self-signed cert/key pair whose only SAN is `name`, either
+/// a DNS name or an IP address. `redis-rs`'s non-`insecure` TLS path
+/// always checks the hostname (see `src/config.rs`'s module doc comment
+/// for why it can't be split from the chain check the way
+/// `driver-postgres`'s `VerifyCa` does), so unlike that crate's own
+/// `self_signed_cert_pem`, this one is also used to build a certificate
+/// that genuinely matches the real connection host, not just mismatched
+/// ones.
+fn self_signed_cert_pem(name: &str) -> (Vec<u8>, Vec<u8>) {
+    let san = match name.parse::<IpAddr>() {
+        Ok(ip) => rcgen::SanType::IpAddress(ip),
+        Err(_) => rcgen::SanType::DnsName(name.try_into().expect("valid dns name")),
+    };
+    let mut params = rcgen::CertificateParams::default();
+    params.subject_alt_names = vec![san];
+    let key_pair = rcgen::KeyPair::generate().expect("generate key pair");
+    let cert = params.self_signed(&key_pair).expect("self-sign cert");
+    (
+        cert.pem().into_bytes(),
+        key_pair.serialize_pem().into_bytes(),
+    )
+}
+
+/// The host testcontainers will actually connect through, discovered by
+/// starting a throwaway plain container and asking it: `get_host()`
+/// reflects the Docker client's own configuration (a plain per-daemon
+/// property, e.g. `127.0.0.1` for a local Docker socket), not anything
+/// container-specific, but the API is only reachable from a running
+/// container. This container is torn down as soon as the function
+/// returns.
+async fn docker_host_string() -> String {
+    let probe = start_container().await;
+    probe.get_host().await.expect("container host").to_string()
+}
+
+/// Starts a real Redis server with its TLS listener enabled on
+/// [`REDIS_TLS_PORT`], alongside its plaintext port (left enabled so the
+/// well-established `"Ready to accept connections"` readiness message is
+/// never solely dependent on the exact wording Redis uses for its TLS
+/// listener specifically). `--tls-auth-clients no` means this is
+/// server-authentication-only TLS, matching what `driver-redis` actually
+/// implements (mTLS is out of scope, same as `driver-postgres`), so the
+/// server's own `--tls-ca-cert-file` (needed only to authenticate
+/// clients) is never exercised; `cert_pem` doubles as that value purely
+/// so the server has *something* valid to load there.
+async fn start_tls_container(cert_pem: Vec<u8>, key_pem: Vec<u8>) -> ContainerAsync<GenericImage> {
+    GenericImage::new("redis", REDIS_TAG)
+        .with_exposed_port(REDIS_TLS_PORT.tcp())
+        .with_wait_for(WaitFor::log(
+            LogWaitStrategy::stdout("Ready to accept connections").with_times(2),
+        ))
+        .with_copy_to("/tls/redis.crt", cert_pem.clone())
+        .with_copy_to("/tls/redis.key", key_pem)
+        .with_copy_to("/tls/ca.crt", cert_pem)
+        .with_cmd([
+            "--tls-port",
+            "6380",
+            "--tls-cert-file",
+            "/tls/redis.crt",
+            "--tls-key-file",
+            "/tls/redis.key",
+            "--tls-ca-cert-file",
+            "/tls/ca.crt",
+            "--tls-auth-clients",
+            "no",
+        ])
+        .start()
+        .await
+        .expect("start redis container with TLS enabled")
+}
+
+fn write_ca_file(pem: &[u8]) -> tempfile::NamedTempFile {
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new().expect("create temp file for ca_path");
+    file.write_all(pem).expect("write ca_path contents");
+    file.flush().expect("flush ca_path contents");
+    file
+}
+
+async fn tls_config(
+    container: &ContainerAsync<GenericImage>,
+    mode: SslMode,
+    ca_path: Option<&std::path::Path>,
+) -> ConnectionConfig {
+    let host = container
+        .get_host()
+        .await
+        .expect("container host")
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(REDIS_TLS_PORT)
+        .await
+        .expect("container tls port");
+
+    ConnectionConfig {
+        host,
+        port,
+        username: String::new(),
+        password: None,
+        database: None,
+        ssl: SslConfig {
+            mode: Some(mode),
+            ca_path: ca_path.map(|p| p.to_path_buf()),
+            client_cert_path: None,
+            client_key_path: None,
+        },
+        read_only: false,
+        additional_fields: HashMap::new(),
+    }
+}
+
+/// `Required` (and `Preferred`) match libpq's own `sslmode=require`
+/// semantics: encrypt the connection, verify nothing about the
+/// certificate at all. Must succeed against a self-signed, untrusted,
+/// hostname-mismatched cert.
+#[tokio::test]
+async fn required_mode_connects_despite_untrusted_self_signed_cert() {
+    let (cert_pem, key_pem) = self_signed_cert_pem("redis-tls-test.invalid");
+    let container = start_tls_container(cert_pem, key_pem).await;
+
+    let config = tls_config(&container, SslMode::Required, None).await;
+    let driver = RedisDriver::new(config);
+    driver
+        .connect()
+        .await
+        .expect("required mode connects without verifying the certificate");
+    driver
+        .ping()
+        .await
+        .expect("command over the unverified TLS connection");
+}
+
+/// The positive case for the mode `driver-redis` can actually support in
+/// full: a certificate whose SAN genuinely matches the real connection
+/// host, trusted via its own PEM as `ssl.ca_path`. Both the chain and the
+/// hostname check must pass.
+#[tokio::test]
+async fn verify_identity_with_correct_ca_path_and_matching_hostname_accepts_connection() {
+    let host = docker_host_string().await;
+    let (cert_pem, key_pem) = self_signed_cert_pem(&host);
+    let container = start_tls_container(cert_pem.clone(), key_pem).await;
+    let ca_file = write_ca_file(&cert_pem);
+
+    let config = tls_config(&container, SslMode::VerifyIdentity, Some(ca_file.path())).await;
+    let driver = RedisDriver::new(config);
+    driver.connect().await.expect("connect over verified TLS");
+    driver
+        .ping()
+        .await
+        .expect("command over verified TLS connection");
+}
+
+/// `driver-redis` cannot express `driver-postgres`'s `VerifyCa` (chain
+/// trusted, hostname unchecked) because `redis-rs`'s TLS API has no hook
+/// for a custom certificate verifier — see `src/config.rs`'s module doc
+/// comment. `VerifyCa` collapses onto `VerifyIdentity`'s stricter
+/// behavior instead of erroring or silently skipping the hostname check,
+/// so both modes must reject the exact same hostname-mismatched cert
+/// here, proving `VerifyCa` never ends up more lenient than intended.
+#[tokio::test]
+async fn verify_ca_rejects_hostname_mismatch_just_like_verify_identity() {
+    for mode in [SslMode::VerifyCa, SslMode::VerifyIdentity] {
+        let (cert_pem, key_pem) = self_signed_cert_pem("redis-tls-test.invalid");
+        let container = start_tls_container(cert_pem.clone(), key_pem).await;
+        let ca_file = write_ca_file(&cert_pem);
+
+        let config = tls_config(&container, mode, Some(ca_file.path())).await;
+        let driver = RedisDriver::new(config);
+        driver.connect().await.expect_err(&format!(
+            "a hostname mismatch must be rejected under {mode:?}"
+        ));
+    }
+}
+
+/// Chain verification is real, not a no-op: a CA that never signed the
+/// presented certificate must be rejected under both modes.
+#[tokio::test]
+async fn verify_ca_and_verify_identity_reject_a_cert_from_an_unrelated_ca() {
+    for mode in [SslMode::VerifyCa, SslMode::VerifyIdentity] {
+        let host = docker_host_string().await;
+        let (cert_pem, key_pem) = self_signed_cert_pem(&host);
+        let (wrong_ca_pem, _unused_key) = self_signed_cert_pem("unrelated-ca.invalid");
+        let container = start_tls_container(cert_pem, key_pem).await;
+        let ca_file = write_ca_file(&wrong_ca_pem);
+
+        let config = tls_config(&container, mode, Some(ca_file.path())).await;
+        let driver = RedisDriver::new(config);
+        driver.connect().await.expect_err(&format!(
+            "a cert not signed by the configured CA must be rejected under {mode:?}"
+        ));
+    }
 }

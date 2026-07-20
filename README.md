@@ -107,7 +107,43 @@ never silently turns write access back on.
 Every mode still verifies the TLS handshake signature for real; only the
 chain-of-trust and hostname checks differ between modes. ClickHouse's own
 TLS support (via `reqwest`) predates this and covers the same mode set
-through `reqwest`'s HTTPS handling instead. Redis has no TLS support yet.
+through `reqwest`'s HTTPS handling instead.
+
+## Redis TLS
+
+`connect`'s `ssl_mode` is implemented for Redis too, via `redis-rs`'s own
+`rustls` integration rather than a hand-rolled connector:
+
+- `disabled` — plaintext, no TLS.
+- `preferred` / `required` — encrypts the connection without verifying
+  the certificate at all, same semantics as the PostgreSQL modes above.
+- `verify_ca`, `verify_identity`, and a missing `ssl_mode` — full chain
+  and hostname verification, against `ssl.ca_path` if given or the
+  platform's native trust store otherwise.
+
+Unlike PostgreSQL, `verify_ca` and `verify_identity` are the same mode
+here: `redis-rs`'s public TLS API only exposes a binary "verify
+everything" / "verify nothing" switch, with no hook for a custom
+certificate verifier, so "trust the chain but skip the hostname check"
+can't be expressed through it the way the PostgreSQL connector does.
+Collapsing `verify_ca` into the stricter `verify_identity` behavior is
+deliberate: it never checks less than the mode asks for, only more.
+
+## MCP protocol compliance
+
+`tools/call` responses follow the MCP spec's actual result shape:
+`{ content: [{ type: "text", text: "..." }], isError, structuredContent }`.
+A tool's return value is JSON-stringified into `content[0].text` and also
+carried untouched in `structuredContent`. A tool that fails (invalid
+arguments, or a driver error) still comes back as a successful JSON-RPC
+response with `isError: true`, never a JSON-RPC-level error, so the
+calling model actually sees the failure instead of an empty result. Only
+calling a tool name that isn't registered is a JSON-RPC-level error
+(`METHOD_NOT_FOUND`).
+
+Returning the bare tool value as `result` (this server's original shape)
+is valid JSON-RPC but renders as nothing in a real MCP client, including
+Claude Code, since every client reads `result.content`.
 
 ## Running with Docker
 

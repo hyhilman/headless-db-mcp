@@ -1,10 +1,26 @@
 use async_trait::async_trait;
+use db_headless_mcp_wire::JsonRpcError;
 
 /// The outcome of one JSON-RPC request handled by [`crate::McpSession`].
 #[derive(Debug, Clone)]
 pub enum AuditOutcome {
     Ok,
     Error { code: i64 },
+}
+
+impl AuditOutcome {
+    /// Classifies a request-level JSON-RPC result. Not used for
+    /// `tools/call`: a tool failure rides back as a *successful*
+    /// JSON-RPC response with `isError: true` inside the result (so the
+    /// calling model actually sees it), and would be misclassified as
+    /// [`AuditOutcome::Ok`] here — see `McpSession::handle_tools_call`,
+    /// which computes its own outcome instead of calling this.
+    pub fn from_result<T>(result: &Result<T, JsonRpcError>) -> Self {
+        match result {
+            Ok(_) => Self::Ok,
+            Err(err) => Self::Error { code: err.code },
+        }
+    }
 }
 
 /// One audit record.

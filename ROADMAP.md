@@ -82,6 +82,48 @@ about what's done, what's next, and what to watch out for.
   *same* cert (hostname checked), a wrong CA is rejected under
   `verify_ca`, and `required` connects regardless.
 
+**Redis TLS**
+- `driver-redis` now implements every `SslMode` via `redis-rs`'s own
+  `rustls` integration (`tls-rustls`/`tls-rustls-insecure` features)
+  rather than a hand-rolled connector: `preferred`/`required` use
+  `redis-rs`'s `insecure` connection mode (encrypts, verifies nothing);
+  `verify_ca`, `verify_identity`, and a missing mode all use its
+  non-`insecure` mode (full chain + hostname check against `ca_path` or
+  the native trust store). `verify_ca` and `verify_identity` are
+  identical here, unlike PostgreSQL: `redis-rs`'s public TLS API has no
+  hook for a custom certificate verifier, so "chain trusted, hostname
+  unchecked" can't be built the way `driver-postgres`'s connector does.
+  Collapsing upward (stricter, never more lenient) is the deliberate
+  choice. Live-tested against a real Redis container with a self-signed
+  cert: `required` connects regardless of trust; a cert matching the
+  real connection host and trusted via `ca_path` is accepted under
+  `verify_identity`; a hostname-mismatched cert is rejected under both
+  `verify_ca` and `verify_identity`; a cert from an unrelated CA is
+  rejected under both.
+- Fixed a real bug surfaced by writing those tests: `RedisDriver`
+  established its `ConnectionManager` with `redis-rs`'s default retry
+  config, whose `factor` (100) and unset `max_delay` (backon's own
+  60s default applies) combine to make every failed connect attempt
+  retry for several minutes before surfacing an error, regardless of
+  cause (wrong password, rejected TLS cert, anything permanent). Now
+  bounded to 2 retries with a 1s max delay and a 5s connection timeout,
+  so a connect failure surfaces in seconds. This affected every driver
+  connect failure, not just TLS.
+
+**MCP protocol compliance**
+- `tools/call` now returns the actual MCP spec result shape
+  (`{content: [{type: "text", text}], isError, structuredContent}`)
+  instead of the bare tool `Value` as `result`. The bare shape was valid
+  JSON-RPC but rendered as nothing in a real MCP client, Claude Code
+  included, since every client reads `result.content`. A tool failure
+  (invalid arguments or a driver error) now comes back as a successful
+  JSON-RPC response with `isError: true` rather than a JSON-RPC-level
+  error, so the calling model sees it instead of getting an empty result;
+  only an unregistered tool name is still a protocol-level error. Audit
+  logging tracks this distinction explicitly (`AuditOutcome` is now
+  computed per-branch in `McpSession`, not derived from the JSON-RPC
+  result) so a failed tool call still logs as a failure.
+
 Full workspace (`cargo test --workspace`, `cargo clippy --workspace
 --all-targets -- -D warnings`, `cargo fmt --check`) is green as of the
 last commit on `main`.

@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::audit::{AuditEvent, AuditLogger, AuditOutcome};
 use crate::registry::{McpToolRegistry, ToolCallError};
-use crate::tool::McpToolError;
+use crate::tool::{CallToolResult, McpToolError};
 
 /// A placeholder protocol version string for this Phase 1 implementation.
 /// Not yet validated against a client-supplied version — full
@@ -64,16 +64,13 @@ impl McpSession {
 
     async fn handle_request(&self, request: JsonRpcRequest) -> JsonRpcMessage {
         let method = request.method.clone();
-        let (result, tool_name) = self.dispatch_request(&request).await;
+        let (result, tool_name, outcome) = self.dispatch_request(&request).await;
 
         self.audit
             .record(AuditEvent {
                 method,
                 tool_name,
-                outcome: match &result {
-                    Ok(_) => AuditOutcome::Ok,
-                    Err(err) => AuditOutcome::Error { code: err.code },
-                },
+                outcome,
             })
             .await;
 
@@ -87,22 +84,34 @@ impl McpSession {
         }
     }
 
-    /// Returns the handler's result plus the tool name (if any) so the
-    /// caller can attach it to the audit record without re-parsing params.
+    /// Returns the handler's result, the tool name (if any), and the audit
+    /// outcome, so the caller can log without re-parsing params or
+    /// re-deriving success/failure from the JSON-RPC-level result (which,
+    /// for `tools/call`, is *not* the same thing — see
+    /// [`AuditOutcome::from_result`]).
     async fn dispatch_request(
         &self,
         request: &JsonRpcRequest,
-    ) -> (Result<Value, JsonRpcError>, Option<String>) {
+    ) -> (Result<Value, JsonRpcError>, Option<String>, AuditOutcome) {
         match request.method.as_str() {
-            "initialize" => (self.handle_initialize(), None),
-            "tools/list" => (self.handle_tools_list(), None),
+            "initialize" => {
+                let result = self.handle_initialize();
+                let outcome = AuditOutcome::from_result(&result);
+                (result, None, outcome)
+            }
+            "tools/list" => {
+                let result = self.handle_tools_list();
+                let outcome = AuditOutcome::from_result(&result);
+                (result, None, outcome)
+            }
             "tools/call" => self.handle_tools_call(request.params.clone()).await,
-            other => (
-                Err(JsonRpcError::method_not_found(format!(
+            other => {
+                let result = Err(JsonRpcError::method_not_found(format!(
                     "unknown method: {other}"
-                ))),
-                None,
-            ),
+                )));
+                let outcome = AuditOutcome::from_result(&result);
+                (result, None, outcome)
+            }
         }
     }
 
@@ -136,44 +145,52 @@ impl McpSession {
     async fn handle_tools_call(
         &self,
         params: Option<Value>,
-    ) -> (Result<Value, JsonRpcError>, Option<String>) {
+    ) -> (Result<Value, JsonRpcError>, Option<String>, AuditOutcome) {
         if let Err(err) = self.require_initialized() {
-            return (Err(err), None);
+            let outcome = AuditOutcome::Error { code: err.code };
+            return (Err(err), None, outcome);
         }
 
         let params = match params.map(serde_json::from_value::<ToolCallParams>) {
             Some(Ok(params)) => params,
             Some(Err(err)) => {
-                return (
-                    Err(JsonRpcError::invalid_params(format!(
-                        "invalid \"tools/call\" params: {err}"
-                    ))),
-                    None,
-                )
+                let error =
+                    JsonRpcError::invalid_params(format!("invalid \"tools/call\" params: {err}"));
+                let outcome = AuditOutcome::Error { code: error.code };
+                return (Err(error), None, outcome);
             }
             None => {
-                return (
-                    Err(JsonRpcError::invalid_params(
-                        "\"tools/call\" requires params",
-                    )),
-                    None,
-                )
+                let error = JsonRpcError::invalid_params("\"tools/call\" requires params");
+                let outcome = AuditOutcome::Error { code: error.code };
+                return (Err(error), None, outcome);
             }
         };
 
         let tool_name = params.name.clone();
         let result = self.registry.call(&params.name, params.arguments).await;
-        let mapped = result.map_err(|err| match err {
-            ToolCallError::Unknown(unknown) => JsonRpcError::method_not_found(unknown.to_string()),
-            ToolCallError::Failed(McpToolError::InvalidArguments(message)) => {
-                JsonRpcError::invalid_params(message)
+        let (mapped, outcome) = match result {
+            Ok(value) => (
+                Ok(CallToolResult::success(value).into_value()),
+                AuditOutcome::Ok,
+            ),
+            Err(ToolCallError::Unknown(unknown)) => {
+                let error = JsonRpcError::method_not_found(unknown.to_string());
+                let outcome = AuditOutcome::Error { code: error.code };
+                (Err(error), outcome)
             }
-            ToolCallError::Failed(McpToolError::Failed(message)) => {
-                JsonRpcError::internal_error(message)
+            Err(ToolCallError::Failed(err)) => {
+                let code = match &err {
+                    McpToolError::InvalidArguments(_) => JsonRpcError::INVALID_PARAMS,
+                    McpToolError::Failed(_) => JsonRpcError::INTERNAL_ERROR,
+                };
+                (
+                    Ok(CallToolResult::error(err.to_string()).into_value()),
+                    AuditOutcome::Error { code },
+                )
             }
-        });
+        };
 
-        (mapped, Some(tool_name))
+        (mapped, Some(tool_name), outcome)
     }
 
     fn handle_notification(&self, notification: JsonRpcNotification) {
@@ -304,11 +321,73 @@ mod tests {
         let JsonRpcMessage::SuccessResponse(success) = reply else {
             panic!("expected success response");
         };
-        assert_eq!(success.result, json!({"message": "hi"}));
+        assert_eq!(success.result["isError"], json!(false));
+        assert_eq!(
+            success.result["structuredContent"],
+            json!({"message": "hi"})
+        );
+        let content = success.result["content"].as_array().expect("content array");
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        let expected_text = serde_json::to_string_pretty(&json!({"message": "hi"})).unwrap();
+        assert_eq!(content[0]["text"], json!(expected_text));
 
         let events = audit.events.lock().unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].tool_name.as_deref(), Some("echo"));
+    }
+
+    struct FailingStub;
+
+    #[async_trait]
+    impl McpTool for FailingStub {
+        fn name(&self) -> &str {
+            "failing"
+        }
+        fn description(&self) -> &str {
+            "always fails"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        async fn call(&self, _arguments: Option<Value>) -> Result<Value, McpToolError> {
+            Err(McpToolError::Failed("boom".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_call_failure_is_reported_in_band_not_as_a_protocol_error() {
+        let mut registry = McpToolRegistry::new();
+        registry.register(Arc::new(FailingStub));
+        let audit = Arc::new(RecordingAudit::default());
+        let session = Arc::new(McpSession::new(Arc::new(registry), audit.clone()));
+        session
+            .handle(JsonRpcMessage::Request(request(1, "initialize", None)))
+            .await;
+
+        let call_params = json!({"name": "failing"});
+        let reply = session
+            .handle(JsonRpcMessage::Request(request(
+                2,
+                "tools/call",
+                Some(call_params),
+            )))
+            .await
+            .expect("reply");
+
+        let JsonRpcMessage::SuccessResponse(success) = reply else {
+            panic!("a tool execution failure must still be a JSON-RPC success response, with isError set inside the result, so the client actually renders it");
+        };
+        assert_eq!(success.result["isError"], json!(true));
+        let content = success.result["content"].as_array().expect("content array");
+        assert_eq!(content[0]["text"], json!("boom"));
+
+        let events = audit.events.lock().unwrap();
+        assert!(
+            matches!(events[1].outcome, AuditOutcome::Error { .. }),
+            "a failed tool call must still audit-log as an error even though the JSON-RPC \
+             envelope itself is a success response, or failures become invisible to audit logs"
+        );
     }
 
     #[tokio::test]

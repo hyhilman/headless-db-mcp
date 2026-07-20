@@ -52,9 +52,10 @@
 //! shape available given the trait's synchronous signature.
 
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use redis::aio::ConnectionManager;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use tokio::sync::RwLock;
 
 use db_headless_core::{
@@ -94,6 +95,31 @@ fn fixed_database_pool_error(verb: &str) -> DriverError {
     )
 }
 
+/// `ConnectionManagerConfig`'s own defaults are unusable for a connect
+/// call a caller is synchronously waiting on: `redis-rs` 0.27's
+/// `ConnectionManager` reuses `backon`'s `ExponentialBuilder`, whose
+/// `min_delay` defaults to 1 second and is not exposed by
+/// `ConnectionManagerConfig` at all, while `ConnectionManagerConfig`'s own
+/// `factor` (default `100`) is fed straight into `backon` as the
+/// per-retry growth *multiplier*, not as a millisecond unit the way its
+/// own doc comment describes. With no `max_delay` set either,
+/// `backon`'s own 60-second default caps every delay after the first —
+/// so a single failed connect (wrong password, a rejected TLS
+/// certificate, anything permanent) silently retries for several
+/// minutes before the error ever reaches the caller. `set_max_delay`
+/// bounds that blowup; `set_number_of_retries` keeps a couple of retries
+/// for a genuinely transient blip rather than dropping resilience to
+/// zero for the reconnects `ConnectionManager` runs later in the
+/// session (the same `retry_strategy` this builds is reused for every
+/// reconnect after the connection is established, not just this first
+/// one).
+fn connection_manager_config() -> ConnectionManagerConfig {
+    ConnectionManagerConfig::new()
+        .set_number_of_retries(2)
+        .set_max_delay(1000)
+        .set_connection_timeout(Duration::from_secs(5))
+}
+
 impl RedisDriver {
     pub fn new(config: ConnectionConfig) -> Self {
         Self {
@@ -112,14 +138,9 @@ impl RedisDriver {
     }
 
     async fn establish(&self, db_override: Option<i64>) -> DriverResult<(ConnectionManager, i64)> {
-        let mut info = config::build_connection_info(&self.config)?;
-        if let Some(db) = db_override {
-            info.redis.db = db;
-        }
-
-        let client = redis::Client::open(info).map_err(error::map_connect_error)?;
+        let client = config::build_client(&self.config, db_override)?;
         let mut manager = client
-            .get_connection_manager()
+            .get_connection_manager_with_config(connection_manager_config())
             .await
             .map_err(error::map_connect_error)?;
         let client_id = redis::cmd("CLIENT")
@@ -364,8 +385,7 @@ impl DatabaseDriver for RedisDriver {
 /// no reconnect logic is wanted for a one-shot admin command) purely to
 /// send `CLIENT KILL ID` against the driver's own cached client id.
 async fn kill_client(config: &ConnectionConfig, client_id: i64) -> DriverResult<()> {
-    let info = config::build_connection_info(config)?;
-    let client = redis::Client::open(info).map_err(error::map_connect_error)?;
+    let client = config::build_client(config, None)?;
     let mut connection = client
         .get_multiplexed_async_connection()
         .await
