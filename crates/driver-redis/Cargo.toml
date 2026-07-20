@@ -1,0 +1,24 @@
+[package]
+name = "db-headless-driver-redis"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Redis DatabaseDriver implementation via redis-rs."
+
+[dependencies]
+db-headless-core = { path = "../core" }
+redis.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+futures-core.workspace = true
+async-stream.workspace = true
+tracing.workspace = true
+serde_json = "1"
+secrecy = { version = "0.10", features = ["serde"] }
+
+[dev-dependencies]
+futures-util = "0.3"
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["redis"] }
+tokio = { workspace = true, features = ["full"] }

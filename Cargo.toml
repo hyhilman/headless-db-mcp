@@ -9,6 +9,8 @@ members = [
     "crates/transport-stdio",
     "crates/transport-http",
     "crates/driver-postgres",
+    "crates/driver-redis",
+    "crates/driver-clickhouse",
     "crates/connections",
     "crates/server",
 ]
@@ -32,6 +34,9 @@ axum = "0.7"
 governor = "0.6"
 subtle = "2"
 tokio-postgres = "0.7"
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+async-stream = "0.3"
 
 [profile.release]
 lto = true

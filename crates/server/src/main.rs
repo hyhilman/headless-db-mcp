@@ -2,9 +2,9 @@
 //! into either the stdio transport or the HTTP+SSE transport.
 //!
 //! Registers the `ping`/`echo` transport smoke-test tools from Phase 1,
-//! plus the Phase 2 database tool surface backed by a
-//! `db_headless_connections::ConnectionManager` with PostgreSQL
-//! (`db_headless_driver_postgres`) as its only registered driver so far.
+//! plus the database tool surface backed by a
+//! `db_headless_connections::ConnectionManager` with PostgreSQL, Redis,
+//! and ClickHouse (Phase 2/3) registered as drivers.
 //! `GetTableDdl`/`SwitchDatabase`/`SwitchSchema` and beyond are deferred;
 //! see `db_headless_connections`'s crate docs for the current tool list.
 //!
@@ -37,7 +37,9 @@ use db_headless_connections::{
     GetConnectionStatusTool, ListConnectionsTool, ListDatabasesTool, ListSchemasTool,
     ListTablesTool,
 };
+use db_headless_driver_clickhouse::ClickHouseDriverFactory;
 use db_headless_driver_postgres::PostgresDriverFactory;
+use db_headless_driver_redis::RedisDriverFactory;
 use db_headless_mcp_server::{EchoTool, McpSession, McpToolRegistry, PingTool, TracingAuditLogger};
 use db_headless_transport_http::{run_http, HttpTransportConfig};
 use db_headless_transport_stdio::run_stdio;
@@ -79,6 +81,14 @@ fn build_session() -> McpSession {
     connection_manager.register_driver_factory(
         db_headless_driver_postgres::DATABASE_TYPE_ID,
         Arc::new(PostgresDriverFactory),
+    );
+    connection_manager.register_driver_factory(
+        db_headless_driver_redis::DATABASE_TYPE_ID,
+        Arc::new(RedisDriverFactory),
+    );
+    connection_manager.register_driver_factory(
+        db_headless_driver_clickhouse::DATABASE_TYPE_ID,
+        Arc::new(ClickHouseDriverFactory),
     );
     let connection_manager = Arc::new(connection_manager);
 

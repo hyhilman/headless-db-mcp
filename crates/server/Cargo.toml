@@ -20,6 +20,8 @@ db-headless-transport-stdio = { path = "../transport-stdio" }
 db-headless-transport-http = { path = "../transport-http" }
 db-headless-connections = { path = "../connections" }
 db-headless-driver-postgres = { path = "../driver-postgres" }
+db-headless-driver-redis = { path = "../driver-redis" }
+db-headless-driver-clickhouse = { path = "../driver-clickhouse" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
