@@ -124,6 +124,16 @@ about what's done, what's next, and what to watch out for.
   computed per-branch in `McpSession`, not derived from the JSON-RPC
   result) so a failed tool call still logs as a failure.
 
+**Docker image publishing**
+- `.github/workflows/docker-publish.yml` builds and pushes the image to
+  `ghcr.io/hyhilman/headless-db-mcp` on every `v*` tag, using the
+  workflow's own `GITHUB_TOKEN` (no separate registry credential to
+  manage) and `docker/metadata-action` to derive `{version}`,
+  `{major}.{minor}`, and `{major}` tags plus `latest`. A new GHCR
+  package defaults to private on first push even for a public repo —
+  needs a one-time manual visibility change in the package's own
+  settings after the first tag is pushed.
+
 Full workspace (`cargo test --workspace`, `cargo clippy --workspace
 --all-targets -- -D warnings`, `cargo fmt --check`) is green as of the
 last commit on `main`.
@@ -164,8 +174,10 @@ register its `DriverFactory` in `crates/server/src/main.rs`.
 - **No master-key rotation.** Losing `DB_HEADLESS_MASTER_KEY` makes every
   stored password permanently unrecoverable — there's no re-encrypt-under-
   a-new-key tool yet.
-- **No CI.** There's no `.github/workflows` in this repo yet — `cargo
-  test --workspace` / `clippy` / `fmt --check` only run locally today.
+- **No test/lint CI.** `.github/workflows/docker-publish.yml` builds and
+  pushes the Docker image to `ghcr.io/hyhilman/headless-db-mcp` on `v*`
+  tags, but nothing runs `cargo test --workspace` / `clippy` /
+  `fmt --check` on a push or PR yet — those still only run locally.
   Worth adding before this has more than one contributor.
 - **Deferred tools**: `GetTableDdl`, `SwitchDatabase`, `SwitchSchema`
   already have driver methods (`fetch_table_ddl`, `switch_database`,

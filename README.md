@@ -147,6 +147,8 @@ Claude Code, since every client reads `result.content`.
 
 ## Running with Docker
 
+Build locally:
+
 ```bash
 docker build -t db-headless-mcp .
 docker run -d --name db-headless-mcp \
@@ -156,6 +158,13 @@ docker run -d --name db-headless-mcp \
   -v db-headless-data:/data \
   -e DB_HEADLESS_DATA_DIR=/data \
   db-headless-mcp
+```
+
+Or pull a tagged release from GHCR instead of building
+(`.github/workflows/docker-publish.yml` pushes one for every `v*` tag):
+
+```bash
+docker pull ghcr.io/hyhilman/headless-db-mcp:<version>
 ```
 
 Or `docker compose up -d` with `DB_HEADLESS_MCP_TOKEN` set in a `.env`
