@@ -1,0 +1,25 @@
+[package]
+name = "db-headless-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Binary crate wiring the driver, secrets, registry, and MCP wire layers into a running server."
+
+[[bin]]
+name = "db-headless-mcp"
+path = "src/main.rs"
+
+[dependencies]
+db-headless-core = { path = "../core" }
+db-headless-secrets = { path = "../secrets" }
+db-headless-registry = { path = "../registry" }
+db-headless-mcp-wire = { path = "../mcp-wire" }
+db-headless-mcp-server = { path = "../mcp-server" }
+db-headless-transport-stdio = { path = "../transport-stdio" }
+db-headless-transport-http = { path = "../transport-http" }
+db-headless-connections = { path = "../connections" }
+db-headless-driver-postgres = { path = "../driver-postgres" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

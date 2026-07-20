@@ -1,0 +1,24 @@
+[package]
+name = "db-headless-connections"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Connection manager (driver factory registry + generation-fenced sessions) and the MCP tools that expose it."
+
+[dependencies]
+db-headless-core = { path = "../core" }
+db-headless-registry = { path = "../registry" }
+db-headless-mcp-server = { path = "../mcp-server" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+secrecy = { version = "0.10", features = ["serde"] }
+
+[dev-dependencies]
+tokio.workspace = true
+futures-core.workspace = true
+futures-util = "0.3"

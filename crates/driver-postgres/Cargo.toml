@@ -1,0 +1,28 @@
+[package]
+name = "db-headless-driver-postgres"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "PostgreSQL DatabaseDriver implementation via tokio-postgres."
+
+[dependencies]
+db-headless-core = { path = "../core" }
+tokio-postgres = { workspace = true, features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1", "array-impls"] }
+tokio.workspace = true
+async-trait.workspace = true
+futures-core.workspace = true
+tracing.workspace = true
+secrecy = { version = "0.10", features = ["serde"] }
+async-stream = "0.3"
+futures-util = "0.3"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+uuid = { version = "1", features = ["serde"] }
+serde_json = "1"
+rust_decimal = { version = "1", features = ["db-postgres"] }
+
+[dev-dependencies]
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["postgres"] }
+tokio = { workspace = true, features = ["full"] }
