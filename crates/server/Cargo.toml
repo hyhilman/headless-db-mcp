@@ -19,6 +19,7 @@ db-headless-mcp-server = { path = "../mcp-server" }
 db-headless-transport-stdio = { path = "../transport-stdio" }
 db-headless-transport-http = { path = "../transport-http" }
 db-headless-connections = { path = "../connections" }
+db-headless-connection-profiles = { path = "../connection-profiles" }
 db-headless-driver-postgres = { path = "../driver-postgres" }
 db-headless-driver-redis = { path = "../driver-redis" }
 db-headless-driver-clickhouse = { path = "../driver-clickhouse" }

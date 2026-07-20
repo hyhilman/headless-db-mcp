@@ -1,0 +1,22 @@
+services:
+  db-headless-mcp:
+    build: .
+    ports:
+      # Bind to loopback on the host; the container itself listens on
+      # 0.0.0.0:8787 because inside its own network namespace that *is*
+      # the container's loopback-equivalent reachable surface.
+      - "127.0.0.1:8787:8787"
+    environment:
+      DB_HEADLESS_MCP_TOKEN: "${DB_HEADLESS_MCP_TOKEN:?set DB_HEADLESS_MCP_TOKEN in .env, do not hardcode it here}"
+      # Optional: enables save_connection_profile/list_connection_profiles/
+      # delete_connection_profile and connect's profile_name argument. Must
+      # stay the same across restarts or stored passwords become unrecoverable.
+      DB_HEADLESS_MASTER_KEY: "${DB_HEADLESS_MASTER_KEY:-}"
+      DB_HEADLESS_MCP_RATE_LIMIT: "120"
+      RUST_LOG: "info"
+    volumes:
+      - db-headless-data:/data
+    restart: unless-stopped
+
+volumes:
+  db-headless-data:

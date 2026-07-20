@@ -10,6 +10,7 @@ description = "Connection manager (driver factory registry + generation-fenced s
 db-headless-core = { path = "../core" }
 db-headless-registry = { path = "../registry" }
 db-headless-mcp-server = { path = "../mcp-server" }
+db-headless-connection-profiles = { path = "../connection-profiles" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -22,3 +23,5 @@ secrecy = { version = "0.10", features = ["serde"] }
 tokio.workspace = true
 futures-core.workspace = true
 futures-util = "0.3"
+db-headless-secrets = { path = "../secrets" }
+tempfile = "3"

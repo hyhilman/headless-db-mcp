@@ -595,18 +595,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
-name = "db-headless-connections"
+name = "db-headless-connection-profiles"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "db-headless-core",
+ "db-headless-secrets",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "db-headless-connections"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "db-headless-connection-profiles",
+ "db-headless-core",
  "db-headless-mcp-server",
  "db-headless-registry",
+ "db-headless-secrets",
  "futures-core",
  "futures-util",
  "secrecy",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -739,6 +757,7 @@ dependencies = [
 name = "db-headless-server"
 version = "0.1.0"
 dependencies = [
+ "db-headless-connection-profiles",
  "db-headless-connections",
  "db-headless-core",
  "db-headless-driver-clickhouse",

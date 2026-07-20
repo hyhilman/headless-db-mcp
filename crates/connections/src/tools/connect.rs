@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use db_headless_connection_profiles::ConnectionProfileManager;
 use db_headless_core::{ConnectionConfig, SslConfig, SslMode};
 use db_headless_mcp_server::{McpTool, McpToolError};
 use secrecy::SecretString;
@@ -13,10 +14,16 @@ use crate::tools::support::{map_manager_error, parse_arguments};
 
 #[derive(Debug, Deserialize)]
 struct ConnectArgs {
-    database_type: String,
-    host: String,
-    port: u16,
-    username: String,
+    #[serde(default)]
+    profile_name: Option<String>,
+    #[serde(default)]
+    database_type: Option<String>,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    username: Option<String>,
     #[serde(default)]
     password: Option<String>,
     #[serde(default)]
@@ -41,14 +48,18 @@ fn parse_ssl_mode(raw: Option<&str>) -> Result<SslMode, McpToolError> {
 
 /// Opens a new connection and returns its `connection_id`.
 ///
-/// Phase 2 deliberately accepts the password as a plain call argument.
-/// There is no persisted, named-connection store with secret-store-backed
-/// credentials yet: `db-headless-secrets` exists as a crate, but wiring
-/// it into a named-connection flow (resolve credentials by a stored
-/// connection id rather than a caller-supplied password) is a real
-/// feature, not just missing polish, and is out of scope for proving the
-/// driver + connection-manager loop this phase delivers. Every `connect`
-/// call here is a fresh, ephemeral, in-memory connection.
+/// Two mutually exclusive ways to call this: pass `profile_name` to
+/// connect with credentials saved earlier via `save_connection_profile`
+/// (the password never appears in this call at all), or pass
+/// `database_type`/`host`/`port`/`username`/`password` directly for a
+/// one-off, ephemeral connection the way Phase 2 originally worked.
+/// Mixing the two in one call is rejected rather than silently picking
+/// one, since a caller that sets both almost certainly has a bug.
+///
+/// `profiles` is `None` when the server was started without
+/// `DB_HEADLESS_MASTER_KEY` — `ConnectionProfileManager` needs a working
+/// `SecretStore`, which needs that key, so profile storage is an opt-in
+/// feature rather than a hard requirement for the ad-hoc connect path.
 ///
 /// `ssl_mode` defaults to `verify_identity` when omitted, not
 /// `disabled` or `preferred` — downgrading certificate verification must
@@ -56,11 +67,25 @@ fn parse_ssl_mode(raw: Option<&str>) -> Result<SslMode, McpToolError> {
 /// default.
 pub struct ConnectTool {
     manager: Arc<ConnectionManager>,
+    profiles: Option<Arc<ConnectionProfileManager>>,
 }
 
 impl ConnectTool {
     pub fn new(manager: Arc<ConnectionManager>) -> Self {
-        Self { manager }
+        Self {
+            manager,
+            profiles: None,
+        }
+    }
+
+    pub fn with_profiles(
+        manager: Arc<ConnectionManager>,
+        profiles: Arc<ConnectionProfileManager>,
+    ) -> Self {
+        Self {
+            manager,
+            profiles: Some(profiles),
+        }
     }
 }
 
@@ -71,16 +96,23 @@ impl McpTool for ConnectTool {
     }
 
     fn description(&self) -> &str {
-        "Opens a new database connection and returns its connection_id."
+        "Opens a new database connection and returns its connection_id. \
+         Pass profile_name to use credentials saved via \
+         save_connection_profile, or pass database_type/host/port/username/\
+         password directly for a one-off connection."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
+                "profile_name": {
+                    "type": "string",
+                    "description": "Name of a profile saved via save_connection_profile. Cannot be combined with database_type/host/port/username/password/database."
+                },
                 "database_type": {
                     "type": "string",
-                    "description": "Driver id the connection manager was registered under, e.g. \"PostgreSQL\"."
+                    "description": "Driver id the connection manager was registered under, e.g. \"PostgreSQL\". Required when profile_name is not given."
                 },
                 "host": { "type": "string" },
                 "port": { "type": "integer", "minimum": 0, "maximum": 65535 },
@@ -93,33 +125,92 @@ impl McpTool for ConnectTool {
                     "description": "Defaults to verify_identity when omitted."
                 }
             },
-            "required": ["database_type", "host", "port", "username"],
+            "oneOf": [
+                { "required": ["profile_name"] },
+                { "required": ["database_type", "host", "port", "username"] }
+            ],
             "additionalProperties": false
         })
     }
 
     async fn call(&self, arguments: Option<Value>) -> Result<Value, McpToolError> {
         let args: ConnectArgs = parse_arguments(arguments)?;
-        let ssl_mode = parse_ssl_mode(args.ssl_mode.as_deref())?;
 
-        let config = ConnectionConfig {
-            host: args.host,
-            port: args.port,
-            username: args.username,
-            password: args.password.map(SecretString::from),
-            database: args.database,
-            ssl: SslConfig {
-                mode: Some(ssl_mode),
-                ca_path: None,
-                client_cert_path: None,
-                client_key_path: None,
-            },
-            additional_fields: HashMap::new(),
+        let (database_type, config) = match args.profile_name {
+            Some(profile_name) => {
+                if args.database_type.is_some()
+                    || args.host.is_some()
+                    || args.port.is_some()
+                    || args.username.is_some()
+                    || args.password.is_some()
+                    || args.database.is_some()
+                    || args.ssl_mode.is_some()
+                {
+                    return Err(McpToolError::InvalidArguments(
+                        "profile_name cannot be combined with database_type/host/port/username/\
+                         password/database/ssl_mode"
+                            .to_string(),
+                    ));
+                }
+
+                let profiles = self.profiles.as_ref().ok_or_else(|| {
+                    McpToolError::Failed(
+                        "connection profiles are not enabled on this server (set \
+                         DB_HEADLESS_MASTER_KEY to enable save_connection_profile)"
+                            .to_string(),
+                    )
+                })?;
+
+                let resolved = profiles
+                    .resolve(&profile_name)
+                    .await
+                    .map_err(|err| McpToolError::Failed(err.to_string()))?;
+                (resolved.database_type, resolved.config)
+            }
+            None => {
+                let database_type = args.database_type.ok_or_else(|| {
+                    McpToolError::InvalidArguments(
+                        "database_type is required when profile_name is not given".to_string(),
+                    )
+                })?;
+                let host = args.host.ok_or_else(|| {
+                    McpToolError::InvalidArguments(
+                        "host is required when profile_name is not given".to_string(),
+                    )
+                })?;
+                let port = args.port.ok_or_else(|| {
+                    McpToolError::InvalidArguments(
+                        "port is required when profile_name is not given".to_string(),
+                    )
+                })?;
+                let username = args.username.ok_or_else(|| {
+                    McpToolError::InvalidArguments(
+                        "username is required when profile_name is not given".to_string(),
+                    )
+                })?;
+                let ssl_mode = parse_ssl_mode(args.ssl_mode.as_deref())?;
+
+                let config = ConnectionConfig {
+                    host,
+                    port,
+                    username,
+                    password: args.password.map(SecretString::from),
+                    database: args.database,
+                    ssl: SslConfig {
+                        mode: Some(ssl_mode),
+                        ca_path: None,
+                        client_cert_path: None,
+                        client_key_path: None,
+                    },
+                    additional_fields: HashMap::new(),
+                };
+                (database_type, config)
+            }
         };
 
         let connection_id = self
             .manager
-            .connect(&args.database_type, config)
+            .connect(&database_type, config)
             .await
             .map_err(map_manager_error)?;
 
@@ -129,6 +220,10 @@ impl McpTool for ConnectTool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use secrecy::SecretString as SecretStringForTest;
     use uuid::Uuid;
 
     use super::*;
@@ -214,5 +309,105 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, McpToolError::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn profile_name_without_a_configured_profile_manager_is_a_clear_error() {
+        let manager = manager_with_mock();
+        let tool = ConnectTool::new(manager);
+
+        let err = tool
+            .call(Some(json!({ "profile_name": "prod" })))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, McpToolError::Failed(message) if message.contains("DB_HEADLESS_MASTER_KEY"))
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_name_combined_with_host_is_invalid_arguments() {
+        let manager = manager_with_mock();
+        let tool = ConnectTool::new(manager);
+
+        let err = tool
+            .call(Some(json!({
+                "profile_name": "prod",
+                "host": "localhost"
+            })))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, McpToolError::InvalidArguments(_)));
+    }
+
+    struct InMemorySecretStore {
+        values: Mutex<HashMap<String, SecretStringForTest>>,
+    }
+
+    impl InMemorySecretStore {
+        fn new() -> Self {
+            Self {
+                values: Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl db_headless_secrets::SecretStore for InMemorySecretStore {
+        async fn get(
+            &self,
+            key: &str,
+        ) -> Result<Option<SecretStringForTest>, db_headless_secrets::SecretError> {
+            Ok(self.values.lock().unwrap().get(key).cloned())
+        }
+
+        async fn set(
+            &self,
+            key: &str,
+            value: SecretStringForTest,
+        ) -> Result<(), db_headless_secrets::SecretError> {
+            self.values.lock().unwrap().insert(key.to_string(), value);
+            Ok(())
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), db_headless_secrets::SecretError> {
+            self.values.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_via_profile_name_resolves_credentials_and_connects() {
+        let manager = manager_with_mock();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let profile_manager = Arc::new(ConnectionProfileManager::new(
+            dir.path().join("profiles.json"),
+            Arc::new(InMemorySecretStore::new()),
+        ));
+        profile_manager
+            .save(db_headless_connection_profiles::SaveProfileParams {
+                name: "prod".to_string(),
+                database_type: "Mock".to_string(),
+                host: "localhost".to_string(),
+                port: 5432,
+                username: "u".to_string(),
+                password: Some(SecretStringForTest::from("secret".to_string())),
+                database: None,
+                ssl_mode: None,
+            })
+            .await
+            .expect("save succeeds");
+
+        let tool = ConnectTool::with_profiles(Arc::clone(&manager), profile_manager);
+
+        let result = tool
+            .call(Some(json!({ "profile_name": "prod" })))
+            .await
+            .expect("connect via profile succeeds");
+
+        assert!(result["connection_id"].as_str().is_some());
+        assert_eq!(manager.list().len(), 1);
     }
 }

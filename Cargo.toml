@@ -11,6 +11,7 @@ members = [
     "crates/driver-postgres",
     "crates/driver-redis",
     "crates/driver-clickhouse",
+    "crates/connection-profiles",
     "crates/connections",
     "crates/server",
 ]

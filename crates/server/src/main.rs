@@ -4,7 +4,10 @@
 //! Registers the `ping`/`echo` transport smoke-test tools from Phase 1,
 //! plus the database tool surface backed by a
 //! `db_headless_connections::ConnectionManager` with PostgreSQL, Redis,
-//! and ClickHouse (Phase 2/3) registered as drivers.
+//! and ClickHouse (Phase 2/3) registered as drivers, plus (when
+//! `DB_HEADLESS_MASTER_KEY` is set) the connection-profile tool surface
+//! backed by a `db_headless_connection_profiles::ConnectionProfileManager`
+//! — see `build_profile_manager`.
 //! `GetTableDdl`/`SwitchDatabase`/`SwitchSchema` and beyond are deferred;
 //! see `db_headless_connections`'s crate docs for the current tool list.
 //!
@@ -27,25 +30,48 @@
 //!   `db-headless-transport-http` at startup.
 //! - `DB_HEADLESS_MCP_RATE_LIMIT` (optional, default `120`): requests per
 //!   source IP per minute before `429`.
+//!
+//! Connection profile storage (saved, named credentials — see
+//! `db_headless_connection_profiles`'s crate docs) is a separate opt-in,
+//! available on both transports:
+//!
+//! - `DB_HEADLESS_MASTER_KEY` (optional): 64 hex characters (32 bytes),
+//!   the AES-256-GCM key protecting stored passwords. Unset means
+//!   profile storage is disabled entirely (`save_connection_profile`,
+//!   `list_connection_profiles`, `delete_connection_profile`, and
+//!   `connect`'s `profile_name` argument are not registered) — the
+//!   ad-hoc `connect` path keeps working either way. Set but malformed
+//!   is a hard startup error, never a silent fallback. This key must
+//!   stay stable across restarts: losing it makes every stored password
+//!   unrecoverable.
+//! - `DB_HEADLESS_DATA_DIR` (optional, default `.`): directory holding
+//!   `secrets.json` (encrypted) and `profiles.json` (metadata only, no
+//!   passwords).
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use db_headless_connection_profiles::ConnectionProfileManager;
 use db_headless_connections::{
-    ConnectTool, ConnectionManager, DescribeTableTool, DisconnectTool, ExecuteQueryTool,
-    GetConnectionStatusTool, ListConnectionsTool, ListDatabasesTool, ListSchemasTool,
-    ListTablesTool,
+    ConnectTool, ConnectionManager, DeleteConnectionProfileTool, DescribeTableTool, DisconnectTool,
+    ExecuteQueryTool, GetConnectionStatusTool, ListConnectionProfilesTool, ListConnectionsTool,
+    ListDatabasesTool, ListSchemasTool, ListTablesTool, SaveConnectionProfileTool,
 };
 use db_headless_driver_clickhouse::ClickHouseDriverFactory;
 use db_headless_driver_postgres::PostgresDriverFactory;
 use db_headless_driver_redis::RedisDriverFactory;
 use db_headless_mcp_server::{EchoTool, McpSession, McpToolRegistry, PingTool, TracingAuditLogger};
+use db_headless_secrets::EncryptedFileSecretStore;
 use db_headless_transport_http::{run_http, HttpTransportConfig};
 use db_headless_transport_stdio::run_stdio;
 
 const DEFAULT_HTTP_BIND: &str = "127.0.0.1:8787";
 const DEFAULT_RATE_LIMIT_PER_MINUTE: u32 = 120;
+const MASTER_KEY_ENV_VAR: &str = "DB_HEADLESS_MASTER_KEY";
+const DATA_DIR_ENV_VAR: &str = "DB_HEADLESS_DATA_DIR";
+const DEFAULT_DATA_DIR: &str = ".";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -54,7 +80,15 @@ async fn main() -> ExitCode {
         .init();
 
     let use_http = std::env::args().any(|arg| arg == "--http");
-    let session = Arc::new(build_session());
+
+    let profiles = match build_profile_manager() {
+        Ok(profiles) => profiles,
+        Err(message) => {
+            tracing::error!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let session = Arc::new(build_session(profiles));
 
     if use_http {
         let config = match build_http_config() {
@@ -76,7 +110,7 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn build_session() -> McpSession {
+fn build_session(profiles: Option<Arc<ConnectionProfileManager>>) -> McpSession {
     let mut connection_manager = ConnectionManager::new();
     connection_manager.register_driver_factory(
         db_headless_driver_postgres::DATABASE_TYPE_ID,
@@ -95,7 +129,15 @@ fn build_session() -> McpSession {
     let mut registry = McpToolRegistry::new();
     registry.register(Arc::new(PingTool));
     registry.register(Arc::new(EchoTool));
-    registry.register(Arc::new(ConnectTool::new(connection_manager.clone())));
+
+    let connect_tool = match &profiles {
+        Some(profiles) => {
+            ConnectTool::with_profiles(connection_manager.clone(), Arc::clone(profiles))
+        }
+        None => ConnectTool::new(connection_manager.clone()),
+    };
+    registry.register(Arc::new(connect_tool));
+
     registry.register(Arc::new(DisconnectTool::new(connection_manager.clone())));
     registry.register(Arc::new(ExecuteQueryTool::new(connection_manager.clone())));
     registry.register(Arc::new(ListDatabasesTool::new(connection_manager.clone())));
@@ -107,7 +149,48 @@ fn build_session() -> McpSession {
     )));
     registry.register(Arc::new(GetConnectionStatusTool::new(connection_manager)));
 
+    if let Some(profiles) = profiles {
+        registry.register(Arc::new(SaveConnectionProfileTool::new(Arc::clone(
+            &profiles,
+        ))));
+        registry.register(Arc::new(ListConnectionProfilesTool::new(Arc::clone(
+            &profiles,
+        ))));
+        registry.register(Arc::new(DeleteConnectionProfileTool::new(profiles)));
+    }
+
     McpSession::new(Arc::new(registry), Arc::new(TracingAuditLogger))
+}
+
+/// Builds the connection-profile manager when the operator has opted in
+/// via `DB_HEADLESS_MASTER_KEY`. A missing key disables profile storage
+/// entirely (`Ok(None)`) rather than falling back to some default key —
+/// the ad-hoc `connect` path (raw credentials per call) is unaffected. A
+/// *present but malformed* key is `Err`, a hard startup failure: silently
+/// treating a typo'd key as "disabled" would hide a real misconfiguration
+/// from the operator instead of failing loudly.
+fn build_profile_manager() -> Result<Option<Arc<ConnectionProfileManager>>, String> {
+    if std::env::var(MASTER_KEY_ENV_VAR).is_err() {
+        tracing::info!(
+            "{MASTER_KEY_ENV_VAR} not set: connection profile storage is disabled \
+             (save_connection_profile, list_connection_profiles, delete_connection_profile, \
+             and connect's profile_name argument are unavailable)"
+        );
+        return Ok(None);
+    }
+
+    let data_dir = std::env::var(DATA_DIR_ENV_VAR).unwrap_or_else(|_| DEFAULT_DATA_DIR.to_string());
+    let secrets_path = Path::new(&data_dir).join("secrets.json");
+    let profiles_path = Path::new(&data_dir).join("profiles.json");
+
+    let secret_store = EncryptedFileSecretStore::from_env(secrets_path).map_err(|error| {
+        format!("failed to initialize connection profile secret store: {error}")
+    })?;
+
+    Ok(Some(Arc::new(ConnectionProfileManager::new(
+        profiles_path,
+        Arc::new(secret_store),
+    ))))
 }
 
 /// Reads HTTP transport config from the environment. Never falls back to
