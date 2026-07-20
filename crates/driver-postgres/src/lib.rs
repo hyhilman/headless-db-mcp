@@ -19,5 +19,6 @@ mod params;
 mod query;
 mod schema;
 mod stream;
+mod tls;
 
 pub use driver::{PostgresDriver, PostgresDriverFactory, DATABASE_TYPE_ID};

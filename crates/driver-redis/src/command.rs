@@ -27,6 +27,114 @@ use db_headless_core::{CellValue, DriverError, DriverErrorKind, DriverResult};
 
 const PLACEHOLDER: &str = "?";
 
+/// Commands this driver knows never mutate the keyspace, covering the six
+/// pseudo-tables (`schema.rs`) plus generic/introspection commands.
+///
+/// Deny-by-default: any command not on this explicit list is treated as
+/// a write and rejected on a `read_only` connection, even if it is
+/// actually harmless (e.g. a newer read-only command this list has not
+/// caught up with yet). A false rejection only costs a retry; a false
+/// permission would defeat the whole point of `read_only`.
+const READ_ONLY_COMMANDS: &[&str] = &[
+    // string
+    "GET",
+    "MGET",
+    "GETRANGE",
+    "STRLEN",
+    "SUBSTR",
+    // hash
+    "HGET",
+    "HGETALL",
+    "HMGET",
+    "HKEYS",
+    "HVALS",
+    "HLEN",
+    "HSTRLEN",
+    "HEXISTS",
+    "HRANDFIELD",
+    "HSCAN",
+    // list
+    "LRANGE",
+    "LLEN",
+    "LINDEX",
+    "LPOS",
+    // set
+    "SMEMBERS",
+    "SISMEMBER",
+    "SMISMEMBER",
+    "SCARD",
+    "SRANDMEMBER",
+    "SSCAN",
+    "SINTER",
+    "SUNION",
+    "SDIFF",
+    // sorted set
+    "ZRANGE",
+    "ZRANGEBYSCORE",
+    "ZRANGEBYLEX",
+    "ZREVRANGE",
+    "ZREVRANGEBYSCORE",
+    "ZREVRANGEBYLEX",
+    "ZSCORE",
+    "ZMSCORE",
+    "ZCARD",
+    "ZCOUNT",
+    "ZLEXCOUNT",
+    "ZRANK",
+    "ZREVRANK",
+    "ZSCAN",
+    "ZRANDMEMBER",
+    // stream
+    "XRANGE",
+    "XREVRANGE",
+    "XLEN",
+    "XREAD",
+    "XINFO",
+    // generic key introspection
+    "EXISTS",
+    "TYPE",
+    "TTL",
+    "PTTL",
+    "EXPIRETIME",
+    "PEXPIRETIME",
+    "KEYS",
+    "SCAN",
+    "DBSIZE",
+    "RANDOMKEY",
+    "DUMP",
+    "OBJECT",
+    "BITCOUNT",
+    "BITPOS",
+    "GETBIT",
+    // connection/server (no data mutation)
+    "PING",
+    "ECHO",
+    "TIME",
+    "COMMAND",
+    "INFO",
+    "MEMORY",
+];
+
+/// Rejects `query` on a `read_only` connection unless its command verb is
+/// on [`READ_ONLY_COMMANDS`]. Runs before parameter binding since the
+/// classification only needs the command name, not the bound values.
+pub(crate) fn require_read_only(query: &str) -> DriverResult<()> {
+    let tokens = tokenize(query)?;
+    let name = tokens
+        .first()
+        .ok_or_else(|| DriverError::new(DriverErrorKind::Query, "empty Redis command"))?
+        .to_uppercase();
+
+    if READ_ONLY_COMMANDS.contains(&name.as_str()) {
+        Ok(())
+    } else {
+        Err(DriverError::new(
+            DriverErrorKind::Query,
+            format!("read-only connection: command '{name}' is not permitted"),
+        ))
+    }
+}
+
 /// Splits `input` into whitespace-separated tokens, treating a
 /// single-quoted or double-quoted substring as one token regardless of
 /// the whitespace inside it. Quote characters are consumed, not included
@@ -192,5 +300,30 @@ mod tests {
         .expect("build command");
         let packed = String::from_utf8_lossy(&cmd.get_packed_command()).into_owned();
         assert!(packed.contains("value ? with spaces"));
+    }
+
+    #[test]
+    fn read_only_command_is_allowed_regardless_of_case() {
+        require_read_only("get mykey").expect("lowercase GET is allowed");
+        require_read_only("HGETALL myhash").expect("HGETALL is allowed");
+    }
+
+    #[test]
+    fn write_command_is_rejected() {
+        let err = require_read_only("SET mykey myvalue").unwrap_err();
+        assert_eq!(err.kind, DriverErrorKind::Query);
+        assert!(err.message.contains("SET"));
+    }
+
+    #[test]
+    fn unknown_command_is_rejected_not_silently_allowed() {
+        let err = require_read_only("SOMENEWCOMMAND arg").unwrap_err();
+        assert_eq!(err.kind, DriverErrorKind::Query);
+    }
+
+    #[test]
+    fn empty_command_is_rejected_by_require_read_only_too() {
+        let err = require_read_only("   ").unwrap_err();
+        assert_eq!(err.kind, DriverErrorKind::Query);
     }
 }

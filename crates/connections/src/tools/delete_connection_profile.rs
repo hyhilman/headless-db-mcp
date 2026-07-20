@@ -132,6 +132,7 @@ mod tests {
                 password: Some(SecretString::from("hunter2".to_string())),
                 database: None,
                 ssl_mode: None,
+                read_only: None,
             })
             .await
             .expect("save succeeds");

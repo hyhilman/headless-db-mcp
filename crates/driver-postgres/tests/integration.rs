@@ -9,13 +9,13 @@ use std::time::Duration;
 
 use db_headless_core::{
     CellValue, ConnectionConfig, CreateDatabaseRequest, DatabaseDriver, DriverErrorKind, SslConfig,
-    StreamElement,
+    SslMode, StreamElement,
 };
 use db_headless_driver_postgres::PostgresDriver;
 use futures_util::StreamExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::ContainerAsync;
+use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 
 const POSTGRES_PASSWORD: &str = "real-s3cret-value";
 
@@ -45,6 +45,7 @@ async fn config_for(container: &ContainerAsync<Postgres>, password: &str) -> Con
         password: Some(secrecy::SecretString::from(password.to_string())),
         database: Some("postgres".to_string()),
         ssl: SslConfig::disabled(),
+        read_only: false,
         additional_fields: HashMap::new(),
     }
 }
@@ -271,6 +272,54 @@ async fn execute_user_query_insert_actually_persists() {
     );
 }
 
+/// A `read_only` connection must let Postgres itself reject a write, not
+/// merely rely on this server declining to call a write method: the
+/// server opens `execute_user_query`'s transaction with `BEGIN READ
+/// ONLY`, so the write fails with Postgres's own error rather than a
+/// client-side string check that a CTE or function call could slip past.
+#[tokio::test]
+async fn read_only_connection_rejects_writes_but_allows_selects() {
+    let container = start_container().await;
+    let driver = connected_driver(&container).await;
+
+    driver
+        .execute("CREATE TABLE read_only_guard (id INT PRIMARY KEY)")
+        .await
+        .expect("create table");
+
+    let mut read_only_config = config_for(&container, POSTGRES_PASSWORD).await;
+    read_only_config.read_only = true;
+    let read_only_driver = PostgresDriver::new(read_only_config);
+    read_only_driver.connect().await.expect("connect");
+
+    let select = read_only_driver
+        .execute_user_query("SELECT id FROM read_only_guard", None, None)
+        .await
+        .expect("select still works on a read-only connection");
+    assert_eq!(select.rows.len(), 0);
+
+    let insert_err = read_only_driver
+        .execute_user_query(
+            "INSERT INTO read_only_guard (id) VALUES ($1)",
+            None,
+            Some(&[CellValue::Text("1".to_string())]),
+        )
+        .await
+        .expect_err("insert must be rejected on a read-only connection");
+    assert_eq!(insert_err.kind, DriverErrorKind::Query);
+
+    let verify = connected_driver(&container).await;
+    let readback = verify
+        .execute_user_query("SELECT id FROM read_only_guard", None, None)
+        .await
+        .expect("read back");
+    assert_eq!(
+        readback.rows.len(),
+        0,
+        "the rejected insert must not have persisted anything"
+    );
+}
+
 #[tokio::test]
 async fn stream_rows_yields_multiple_batches_matching_total_count() {
     let container = start_container().await;
@@ -489,4 +538,178 @@ async fn cancel_query_interrupts_a_long_running_query() {
         elapsed < Duration::from_secs(20),
         "cancellation should interrupt the query well before its natural 30s completion, took {elapsed:?}"
     );
+}
+
+/// The official Postgres image runs every `/docker-entrypoint-initdb.d/*`
+/// script (sourced, not executed, since the copied-in file is not
+/// marked executable) after `initdb` but before the real server starts,
+/// running as the `postgres` user against `$PGDATA`. Copying the
+/// generated cert/key in elsewhere first and letting this script `cp`
+/// them into place sidesteps entirely having to make a host-copied file
+/// land inside the container already owned by `postgres` with `0600`
+/// permissions -- the `cp` here creates a brand new file owned by
+/// whoever ran it, which is the postgres user script executes as.
+const ENABLE_TLS_INIT_SCRIPT: &str = r#"#!/bin/bash
+set -e
+cp /tmp/tls/server.crt "$PGDATA/server.crt"
+cp /tmp/tls/server.key "$PGDATA/server.key"
+chmod 600 "$PGDATA/server.key"
+cat >> "$PGDATA/postgresql.conf" <<'EOF'
+ssl = on
+ssl_cert_file = 'server.crt'
+ssl_key_file = 'server.key'
+EOF
+"#;
+
+/// Generates a self-signed cert/key pair for `dns_name`. Deliberately
+/// used with a `dns_name` that can never match the container's real
+/// connection address (an IP, or `localhost`), so `VerifyIdentity`'s
+/// hostname check has something real to reject regardless of how this
+/// environment's Docker daemon happens to be reachable.
+fn self_signed_cert_pem(dns_name: &str) -> (Vec<u8>, Vec<u8>) {
+    let mut params = rcgen::CertificateParams::default();
+    params.subject_alt_names = vec![rcgen::SanType::DnsName(
+        dns_name.try_into().expect("valid dns name"),
+    )];
+    let key_pair = rcgen::KeyPair::generate().expect("generate key pair");
+    let cert = params.self_signed(&key_pair).expect("self-sign cert");
+    (
+        cert.pem().into_bytes(),
+        key_pair.serialize_pem().into_bytes(),
+    )
+}
+
+async fn start_tls_container(cert_pem: Vec<u8>, key_pem: Vec<u8>) -> ContainerAsync<Postgres> {
+    Postgres::default()
+        .with_password(POSTGRES_PASSWORD)
+        .with_copy_to("/tmp/tls/server.crt", cert_pem)
+        .with_copy_to("/tmp/tls/server.key", key_pem)
+        .with_copy_to(
+            "/docker-entrypoint-initdb.d/00-enable-ssl.sh",
+            ENABLE_TLS_INIT_SCRIPT.as_bytes().to_vec(),
+        )
+        .start()
+        .await
+        .expect("start postgres container with TLS enabled")
+}
+
+fn write_ca_file(pem: &[u8]) -> tempfile::NamedTempFile {
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new().expect("create temp file for ca_path");
+    file.write_all(pem).expect("write ca_path contents");
+    file.flush().expect("flush ca_path contents");
+    file
+}
+
+async fn tls_config(
+    container: &ContainerAsync<Postgres>,
+    port: u16,
+    mode: SslMode,
+    ca_path: Option<&std::path::Path>,
+) -> ConnectionConfig {
+    ConnectionConfig {
+        host: container
+            .get_host()
+            .await
+            .expect("container host")
+            .to_string(),
+        port,
+        username: "postgres".to_string(),
+        password: Some(secrecy::SecretString::from(POSTGRES_PASSWORD.to_string())),
+        database: Some("postgres".to_string()),
+        ssl: SslConfig {
+            mode: Some(mode),
+            ca_path: ca_path.map(|p| p.to_path_buf()),
+            client_cert_path: None,
+            client_key_path: None,
+        },
+        read_only: false,
+        additional_fields: HashMap::new(),
+    }
+}
+
+/// `VerifyCa` trusts the server's own self-signed cert (given as its own
+/// CA) and never checks the hostname, so this connects successfully even
+/// though the cert's only SAN (`postgres-tls-test.invalid`) can never
+/// match this container's real connection address.
+#[tokio::test]
+async fn verify_ca_with_correct_ca_path_accepts_connection_despite_hostname_mismatch() {
+    let (cert_pem, key_pem) = self_signed_cert_pem("postgres-tls-test.invalid");
+    let container = start_tls_container(cert_pem.clone(), key_pem).await;
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let ca_file = write_ca_file(&cert_pem);
+
+    let config = tls_config(&container, port, SslMode::VerifyCa, Some(ca_file.path())).await;
+    let driver = PostgresDriver::new(config);
+    driver.connect().await.expect("connect over TLS");
+    driver
+        .execute("SELECT 1")
+        .await
+        .expect("query over verified TLS connection");
+}
+
+/// `VerifyCa` against a CA that never signed the presented certificate
+/// must reject the connection: chain verification is real, not a no-op.
+#[tokio::test]
+async fn verify_ca_with_wrong_ca_path_rejects_connection() {
+    let (cert_pem, key_pem) = self_signed_cert_pem("postgres-tls-test.invalid");
+    let (wrong_ca_pem, _unused_key) = self_signed_cert_pem("unrelated-ca.invalid");
+    let container = start_tls_container(cert_pem, key_pem).await;
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let ca_file = write_ca_file(&wrong_ca_pem);
+
+    let config = tls_config(&container, port, SslMode::VerifyCa, Some(ca_file.path())).await;
+    let driver = PostgresDriver::new(config);
+    driver
+        .connect()
+        .await
+        .expect_err("a cert not signed by the configured CA must be rejected");
+}
+
+/// The property that matters most: `VerifyIdentity` must reject exactly
+/// the connection `VerifyCa` (correctly) accepted above, proving the
+/// hostname check is real and actually distinguishes the two modes
+/// rather than `VerifyIdentity` silently behaving like `VerifyCa`.
+#[tokio::test]
+async fn verify_identity_rejects_hostname_mismatch_even_with_correct_ca_path() {
+    let (cert_pem, key_pem) = self_signed_cert_pem("postgres-tls-test.invalid");
+    let container = start_tls_container(cert_pem.clone(), key_pem).await;
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let ca_file = write_ca_file(&cert_pem);
+
+    let config = tls_config(
+        &container,
+        port,
+        SslMode::VerifyIdentity,
+        Some(ca_file.path()),
+    )
+    .await;
+    let driver = PostgresDriver::new(config);
+    driver
+        .connect()
+        .await
+        .expect_err("a hostname mismatch must be rejected under verify_identity");
+}
+
+/// `Required` (and `Preferred`) match libpq's own `sslmode=require`
+/// semantics: encrypt the connection, verify nothing about the
+/// certificate at all. Must succeed against the same untrusted,
+/// hostname-mismatched self-signed cert the two tests above reject or
+/// accept selectively.
+#[tokio::test]
+async fn required_mode_connects_despite_untrusted_self_signed_cert() {
+    let (cert_pem, key_pem) = self_signed_cert_pem("postgres-tls-test.invalid");
+    let container = start_tls_container(cert_pem, key_pem).await;
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+
+    let config = tls_config(&container, port, SslMode::Required, None).await;
+    let driver = PostgresDriver::new(config);
+    driver
+        .connect()
+        .await
+        .expect("required mode connects without verifying the certificate");
+    driver
+        .execute("SELECT 1")
+        .await
+        .expect("query over the unverified TLS connection");
 }

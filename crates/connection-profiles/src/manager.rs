@@ -20,6 +20,13 @@ use crate::profile::ConnectionProfile;
 /// none). There is deliberately no separate "clear the password" flag in
 /// this phase — delete and recreate the profile if a stored password
 /// needs to be removed without replacing it.
+///
+/// `read_only: None` means "don't change" the same way `password: None`
+/// does, not "set to false": a security-relevant flag like this must
+/// never silently flip off on an unrelated update (e.g. fixing a typo'd
+/// host) the way guardrail #6 already requires for `ssl_mode`. A brand
+/// new profile with `None` defaults to `false`, matching every profile
+/// saved before this field existed.
 #[derive(Debug, Clone)]
 pub struct SaveProfileParams {
     pub name: String,
@@ -30,6 +37,7 @@ pub struct SaveProfileParams {
     pub password: Option<SecretString>,
     pub database: Option<String>,
     pub ssl_mode: Option<SslMode>,
+    pub read_only: Option<bool>,
 }
 
 /// A profile resolved back into a connection-ready shape: the driver-type
@@ -103,6 +111,10 @@ impl ConnectionProfileManager {
             existing.as_ref().is_some_and(|p| p.has_password)
         };
 
+        let read_only = params
+            .read_only
+            .unwrap_or_else(|| existing.as_ref().is_some_and(|p| p.read_only));
+
         let now = now_unix_ms();
         let created_at_unix_ms = existing.as_ref().map_or(now, |p| p.created_at_unix_ms);
 
@@ -114,6 +126,7 @@ impl ConnectionProfileManager {
             username: params.username,
             database: params.database,
             ssl_mode: params.ssl_mode,
+            read_only,
             has_password,
             created_at_unix_ms,
             updated_at_unix_ms: now,
@@ -154,6 +167,7 @@ impl ConnectionProfileManager {
                 client_cert_path: None,
                 client_key_path: None,
             },
+            read_only: profile.read_only,
             additional_fields: HashMap::new(),
         };
 
@@ -243,7 +257,57 @@ mod tests {
             password: Some(SecretString::from("hunter2".to_string())),
             database: Some("appdb".to_string()),
             ssl_mode: None,
+            read_only: None,
         }
+    }
+
+    #[tokio::test]
+    async fn save_then_resolve_round_trips_read_only() {
+        let dir = TempDir::new().expect("tempdir");
+        let manager = manager_in(&dir);
+
+        let mut params = sample_params("readonly-prod");
+        params.read_only = Some(true);
+        manager.save(params).await.expect("save");
+
+        let resolved = manager.resolve("readonly-prod").await.expect("resolve");
+        assert!(resolved.config.read_only);
+
+        let profiles = manager.list().expect("list");
+        assert!(profiles[0].read_only);
+    }
+
+    #[tokio::test]
+    async fn omitting_read_only_on_update_keeps_it_set_rather_than_silently_clearing() {
+        let dir = TempDir::new().expect("tempdir");
+        let manager = manager_in(&dir);
+
+        let mut params = sample_params("prod");
+        params.read_only = Some(true);
+        manager.save(params).await.expect("save");
+
+        let mut update = sample_params("prod");
+        update.host = "new-host".to_string();
+        update.read_only = None;
+        manager.save(update).await.expect("update");
+
+        let resolved = manager.resolve("prod").await.expect("resolve");
+        assert_eq!(resolved.config.host, "new-host");
+        assert!(
+            resolved.config.read_only,
+            "an update that doesn't mention read_only must not silently turn it back off"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_profile_defaults_read_only_to_false_when_omitted() {
+        let dir = TempDir::new().expect("tempdir");
+        let manager = manager_in(&dir);
+
+        manager.save(sample_params("prod")).await.expect("save");
+
+        let resolved = manager.resolve("prod").await.expect("resolve");
+        assert!(!resolved.config.read_only);
     }
 
     #[tokio::test]

@@ -60,6 +60,7 @@ async fn config_for(container: &ContainerAsync<Redis>, password: Option<&str>) -
         password: password.map(|p| secrecy::SecretString::from(p.to_string())),
         database: None,
         ssl: SslConfig::disabled(),
+        read_only: false,
         additional_fields: HashMap::new(),
     }
 }
@@ -170,6 +171,38 @@ async fn null_parameter_is_rejected_rather_than_becoming_an_empty_string() {
         .await
         .expect("check key was never created");
     assert_eq!(result.rows, vec![vec![CellValue::Text("0".to_string())]]);
+}
+
+/// A `read_only` connection must reject a write command through
+/// `execute_user_query` (the only user-reachable arbitrary-command path)
+/// while still allowing a read, and the rejected write must not have
+/// reached the server at all.
+#[tokio::test]
+async fn read_only_connection_rejects_writes_but_allows_reads() {
+    let container = start_container().await;
+    let mut read_only_config = config_for(&container, None).await;
+    read_only_config.read_only = true;
+    let driver = RedisDriver::new(read_only_config);
+    driver.connect().await.expect("connect");
+
+    let get_result = driver
+        .execute_user_query("GET mykey", None, None)
+        .await
+        .expect("a read command is allowed on a read-only connection");
+    assert_eq!(get_result.rows, vec![vec![CellValue::Null]]);
+
+    let set_err = driver
+        .execute_user_query("SET mykey myvalue", None, None)
+        .await
+        .expect_err("a write command must be rejected on a read-only connection");
+    assert_eq!(set_err.kind, DriverErrorKind::Query);
+
+    let verify = connected_driver(&container).await;
+    let readback = verify
+        .execute("EXISTS mykey")
+        .await
+        .expect("check the rejected write never reached the server");
+    assert_eq!(readback.rows, vec![vec![CellValue::Text("0".to_string())]]);
 }
 
 #[tokio::test]

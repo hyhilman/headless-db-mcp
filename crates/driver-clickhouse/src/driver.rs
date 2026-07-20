@@ -152,6 +152,16 @@ impl ClickHouseDriver {
         if let Some(seconds) = self.query_timeout_seconds() {
             params.push(("max_execution_time".to_string(), seconds.to_string()));
         }
+        // `readonly=1` is ClickHouse's own HTTP interface setting: the
+        // server itself rejects any write or setting change, on every
+        // request this driver sends (introspection queries are already
+        // `SELECT`s, so this is a no-op for them). Applied here, in the
+        // one place every query path funnels through, rather than in
+        // each of `execute`/`execute_parameterized`/`execute_user_query`
+        // separately.
+        if self.config.read_only {
+            params.push(("readonly".to_string(), "1".to_string()));
+        }
         params.extend_from_slice(extra_params);
 
         let username = tls::resolve_username(&self.config);

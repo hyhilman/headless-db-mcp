@@ -138,13 +138,23 @@ pub async fn execute_user_query(
     sql: &str,
     row_cap: Option<usize>,
     parameters: Option<&[CellValue]>,
+    read_only: bool,
 ) -> DriverResult<QueryResult> {
     let started = Instant::now();
     let cap = row_cap
         .unwrap_or(RowLimits::EMERGENCY_MAX)
         .min(RowLimits::EMERGENCY_MAX);
 
-    let txn = client.transaction().await.map_err(map_query_error)?;
+    // `read_only` opens the transaction with Postgres's own `BEGIN READ
+    // ONLY`, so the server itself rejects any write inside it — a real
+    // engine-level guarantee, not a client-side statement-string check
+    // that a CTE, function call, or `SELECT ... FOR UPDATE` could slip past.
+    let txn = client
+        .build_transaction()
+        .read_only(read_only)
+        .start()
+        .await
+        .map_err(map_query_error)?;
     let stmt = txn.prepare(sql).await.map_err(map_query_error)?;
 
     let owned;

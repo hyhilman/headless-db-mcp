@@ -54,6 +54,34 @@ about what's done, what's next, and what to watch out for.
 - `Dockerfile` (multi-stage, non-root user, persistent `/data` volume)
   and `docker-compose.yml`.
 
+**Read-only connections**
+- `connect`/`save_connection_profile` accept `read_only: bool`. Enforced
+  by the engine itself on every driver, not by this server parsing SQL:
+  Postgres opens `BEGIN READ ONLY` transactions, ClickHouse sends the
+  HTTP interface's `readonly=1` setting on every request, Redis checks
+  the command verb against an explicit allow-list (deny-by-default).
+  Live-smoke-tested against real Postgres/Redis/ClickHouse containers —
+  a write is rejected and never persists; a read still works.
+- A persisted profile's `read_only` follows the same "omit means keep
+  what's stored" rule as `password`, never silently flipping back to
+  writable on an unrelated update.
+
+**PostgreSQL TLS**
+- `driver-postgres` now implements every `SslMode` for real via `rustls`
+  (`tokio-postgres-rustls`): `preferred`/`required` encrypt without
+  verifying the certificate (matches libpq's `sslmode=require`);
+  `verify_ca` verifies the chain against `ssl.ca_path` but not the
+  hostname (built directly on `rustls-webpki`'s `EndEntityCert`, since
+  rustls's own `WebPkiServerVerifier` always couples the two checks);
+  `verify_identity` (and a missing mode, per guardrail #6) does full
+  chain + hostname verification against `ca_path` or the platform's
+  native trust store. Every mode still verifies the handshake signature
+  for real. Live-tested against a real Postgres container with a
+  self-signed, deliberately hostname-mismatched cert: `verify_ca` accepts
+  it (chain trusted, hostname unchecked), `verify_identity` rejects the
+  *same* cert (hostname checked), a wrong CA is rejected under
+  `verify_ca`, and `required` connects regardless.
+
 Full workspace (`cargo test --workspace`, `cargo clippy --workspace
 --all-targets -- -D warnings`, `cargo fmt --check`) is green as of the
 last commit on `main`.
@@ -86,11 +114,6 @@ register its `DriverFactory` in `crates/server/src/main.rs`.
 
 ## Known gaps worth closing before relying on this in production
 
-- **Postgres TLS is not actually implemented.** `driver-postgres` only
-  connects via `NoTls` today (see the comment in
-  `crates/driver-postgres/src/driver.rs`); `ssl_mode` is accepted and
-  validated but not enforced. Wire up `tokio-postgres-rustls` before
-  connecting to anything over an untrusted network with `verify_identity`.
 - **No credential rotation/clear path.** `save_connection_profile`
   without a password preserves the existing one; there's no way to
   explicitly clear a stored password short of `delete_connection_profile`

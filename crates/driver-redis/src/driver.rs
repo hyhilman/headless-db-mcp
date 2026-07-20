@@ -185,7 +185,14 @@ impl DatabaseDriver for RedisDriver {
         parameters: Option<&[CellValue]>,
     ) -> DriverResult<QueryResult> {
         let mut manager = self.manager().await?;
-        query::execute_user_query(&mut manager, query, row_cap, parameters).await
+        query::execute_user_query(
+            &mut manager,
+            query,
+            row_cap,
+            parameters,
+            self.config.read_only,
+        )
+        .await
     }
 
     async fn fetch_tables(&self, _schema: Option<&str>) -> DriverResult<Vec<TableInfo>> {

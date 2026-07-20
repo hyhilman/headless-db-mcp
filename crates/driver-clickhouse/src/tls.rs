@@ -113,6 +113,7 @@ mod tests {
             password: None,
             database: None,
             ssl,
+            read_only: false,
             additional_fields: HashMap::new(),
         }
     }

@@ -249,6 +249,7 @@ pub(crate) fn sample_config() -> ConnectionConfig {
         password: Some(SecretString::from("hunter2".to_string())),
         database: Some("app".to_string()),
         ssl: SslConfig::default(),
+        read_only: false,
         additional_fields: HashMap::new(),
     }
 }

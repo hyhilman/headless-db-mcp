@@ -31,12 +31,14 @@ use async_trait::async_trait;
 use db_headless_core::{
     CellValue, ColumnInfo, ConnectionConfig, CreateDatabaseRequest, DatabaseDriver,
     DatabaseMetadata, DriverError, DriverErrorKind, DriverFactory, DriverResult, ForeignKeyInfo,
-    IndexInfo, ParameterStyle, QueryResult, RowStream, TableInfo, TableMetadata, TriggerInfo,
+    IndexInfo, ParameterStyle, QueryResult, RowStream, SslMode, TableInfo, TableMetadata,
+    TriggerInfo,
 };
 use tokio::sync::RwLock;
-use tokio_postgres::{tls::NoTlsStream, CancelToken, Client, Connection, NoTls, Socket};
+use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
+use tokio_postgres::{CancelToken, Client, NoTls, Socket};
 
-use crate::{config, error, query, schema, stream};
+use crate::{config, error, query, schema, stream, tls};
 
 pub(crate) struct ConnectedClient {
     pub(crate) client: Client,
@@ -50,7 +52,7 @@ impl Drop for ConnectedClient {
 }
 
 pub struct PostgresDriver {
-    config: ConnectionConfig,
+    pub(crate) config: ConnectionConfig,
     pub(crate) client: RwLock<Option<ConnectedClient>>,
     cancel_token: Mutex<Option<CancelToken>>,
     server_version: Mutex<Option<String>>,
@@ -76,9 +78,33 @@ impl PostgresDriver {
         &self,
         config: &ConnectionConfig,
     ) -> DriverResult<(Client, tokio::task::JoinHandle<()>, CancelToken)> {
-        let pg_config = config::build_config(config)?;
-        let (client, connection): (Client, Connection<Socket, NoTlsStream>) = pg_config
-            .connect(NoTls)
+        let pg_config = config::build_config(config);
+
+        // `Disabled` is the only mode that connects with `NoTls`. Every
+        // other mode -- including a missing `ssl.mode`, which guardrail
+        // #6 requires treating as `VerifyIdentity` -- gets a real
+        // `rustls`-backed connector from `crate::tls`, differing only in
+        // how much of the certificate it actually verifies.
+        if matches!(config.ssl.mode, Some(SslMode::Disabled)) {
+            Self::connect_via(&pg_config, NoTls).await
+        } else {
+            let connector = tls::build_connector(config)?;
+            Self::connect_via(&pg_config, connector).await
+        }
+    }
+
+    async fn connect_via<T>(
+        pg_config: &tokio_postgres::Config,
+        tls: T,
+    ) -> DriverResult<(Client, tokio::task::JoinHandle<()>, CancelToken)>
+    where
+        T: MakeTlsConnect<Socket> + Clone + Send + Sync + 'static,
+        T::Stream: Send,
+        T::TlsConnect: Send,
+        <T::TlsConnect as TlsConnect<Socket>>::Future: Send,
+    {
+        let (client, connection) = pg_config
+            .connect(tls)
             .await
             .map_err(error::map_connect_error)?;
 
@@ -181,7 +207,14 @@ impl DatabaseDriver for PostgresDriver {
     ) -> DriverResult<QueryResult> {
         let mut guard = self.client.write().await;
         let connected = guard.as_mut().ok_or_else(not_connected_error)?;
-        query::execute_user_query(&mut connected.client, sql, row_cap, parameters).await
+        query::execute_user_query(
+            &mut connected.client,
+            sql,
+            row_cap,
+            parameters,
+            self.config.read_only,
+        )
+        .await
     }
 
     async fn fetch_tables(&self, schema: Option<&str>) -> DriverResult<Vec<TableInfo>> {

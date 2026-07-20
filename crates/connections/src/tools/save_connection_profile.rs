@@ -23,6 +23,8 @@ struct SaveConnectionProfileArgs {
     database: Option<String>,
     #[serde(default)]
     ssl_mode: Option<String>,
+    #[serde(default)]
+    read_only: Option<bool>,
 }
 
 /// Mirrors `connect.rs`'s default: a profile saved without an explicit
@@ -53,7 +55,9 @@ fn parse_ssl_mode(raw: Option<&str>) -> Result<Option<SslMode>, McpToolError> {
 /// Omitting `password` on an update to an existing profile keeps
 /// whatever password is already stored — it does not clear it. There is
 /// no separate "clear the password" tool yet; delete and recreate the
-/// profile for that.
+/// profile for that. Omitting `read_only` behaves the same way: it keeps
+/// whatever was stored (false for a brand new profile), rather than
+/// silently turning write access back on on an unrelated update.
 pub struct SaveConnectionProfileTool {
     manager: Arc<ConnectionProfileManager>,
 }
@@ -99,6 +103,10 @@ impl McpTool for SaveConnectionProfileTool {
                     "type": "string",
                     "enum": ["disabled", "preferred", "required", "verify_ca", "verify_identity"],
                     "description": "Defaults to verify_identity when omitted."
+                },
+                "read_only": {
+                    "type": "boolean",
+                    "description": "When true, connections opened via this profile reject any write the underlying engine can be made to refuse. Omit on an update to keep the currently stored value unchanged; defaults to false for a brand new profile."
                 }
             },
             "required": ["name", "database_type", "host", "port", "username"],
@@ -120,6 +128,7 @@ impl McpTool for SaveConnectionProfileTool {
                 password: args.password.map(SecretString::from),
                 database: args.database,
                 ssl_mode,
+                read_only: args.read_only,
             })
             .await
             .map_err(|err| McpToolError::Failed(err.to_string()))?;
@@ -253,5 +262,29 @@ mod tests {
                 .map(|s| s.expose_secret().to_string()),
             Some("hunter2".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn read_only_true_is_saved_and_resolves_onto_the_config() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let manager = Arc::new(ConnectionProfileManager::new(
+            dir.path().join("profiles.json"),
+            Arc::new(InMemorySecretStore::new()),
+        ));
+        let tool = SaveConnectionProfileTool::new(Arc::clone(&manager));
+
+        tool.call(Some(json!({
+            "name": "prod",
+            "database_type": "PostgreSQL",
+            "host": "db.internal",
+            "port": 5432,
+            "username": "app",
+            "read_only": true
+        })))
+        .await
+        .expect("save succeeds");
+
+        let resolved = manager.resolve("prod").await.expect("resolve succeeds");
+        assert!(resolved.config.read_only);
     }
 }

@@ -72,7 +72,12 @@ pub(crate) async fn execute_user_query(
     query: &str,
     row_cap: Option<usize>,
     parameters: Option<&[CellValue]>,
+    read_only: bool,
 ) -> DriverResult<QueryResult> {
+    if read_only {
+        command::require_read_only(query)?;
+    }
+
     let cap = row_cap
         .unwrap_or(RowLimits::EMERGENCY_MAX)
         .min(RowLimits::EMERGENCY_MAX);

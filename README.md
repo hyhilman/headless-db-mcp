@@ -65,6 +65,50 @@ store, not just in your shell history.
 `profiles.json` are written; point it at a persistent volume in Docker
 (see below).
 
+## Read-only connections
+
+Pass `read_only: true` to `connect` (ad-hoc) or `save_connection_profile`
+(persisted) to make a connection reject any write. This is enforced by
+the database engine itself, not by this server parsing SQL:
+
+- **PostgreSQL**: `execute_user_query`/`stream_rows` open their
+  transaction with `BEGIN READ ONLY`, so Postgres itself refuses a write,
+  including one hidden behind a function call or CTE a client-side
+  statement check could miss.
+- **ClickHouse**: every request carries the HTTP interface's own
+  `readonly=1` setting, which the server enforces for writes and setting
+  changes alike.
+- **Redis**, which has no engine-level read-only mode, uses an explicit
+  allow-list of known read commands (`crates/driver-redis/src/command.rs`);
+  anything not on that list is rejected, including commands the list does
+  not yet recognize — a false rejection just costs a retry, a false
+  permission would defeat the point of the flag.
+
+Omitting `read_only` on a `save_connection_profile` update keeps
+whatever was already stored, the same way omitting `password` does — it
+never silently turns write access back on.
+
+## PostgreSQL TLS
+
+`connect`'s `ssl_mode` is fully implemented for PostgreSQL via `rustls`
+(`tokio-postgres-rustls`), not just accepted and ignored:
+
+- `disabled` — plaintext, no TLS.
+- `preferred` / `required` — encrypts the connection but does not verify
+  the server's certificate at all, matching libpq's own `sslmode=require`
+  semantics exactly. `preferred` additionally falls back to plaintext if
+  the server refuses TLS; `required` does not.
+- `verify_ca` — verifies the certificate chains to the CA at `ca_path`,
+  but not the hostname. Requires `ca_path`.
+- `verify_identity`, and a missing `ssl_mode` (guardrail #6: never
+  silently downgrade) — full chain and hostname verification, against
+  `ca_path` if given or the platform's native trust store otherwise.
+
+Every mode still verifies the TLS handshake signature for real; only the
+chain-of-trust and hostname checks differ between modes. ClickHouse's own
+TLS support (via `reqwest`) predates this and covers the same mode set
+through `reqwest`'s HTTPS handling instead. Redis has no TLS support yet.
+
 ## Running with Docker
 
 ```bash

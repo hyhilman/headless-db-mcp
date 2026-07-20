@@ -64,6 +64,13 @@ pub struct ConnectionConfig {
     pub database: Option<String>,
     #[serde(default)]
     pub ssl: SslConfig,
+    /// When true, the driver must reject any write the underlying engine
+    /// can be made to refuse (a read-only transaction, an HTTP `readonly`
+    /// setting, an allow-listed command set) rather than merely declining
+    /// to call its own write methods. This is the connection's own
+    /// guarantee, not a suggestion to callers.
+    #[serde(default)]
+    pub read_only: bool,
     #[serde(default)]
     pub additional_fields: HashMap<String, String>,
 }
@@ -98,6 +105,7 @@ mod tests {
             password: Some(SecretString::from("hunter2".to_string())),
             database: None,
             ssl: SslConfig::default(),
+            read_only: false,
             additional_fields: HashMap::new(),
         };
         let json = serde_json::to_string(&cfg).expect("serialize");

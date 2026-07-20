@@ -49,6 +49,7 @@ async fn config_for(container: &ContainerAsync<ClickHouse>, password: &str) -> C
         password: Some(secrecy::SecretString::from(password.to_string())),
         database: Some("default".to_string()),
         ssl: SslConfig::disabled(),
+        read_only: false,
         additional_fields: HashMap::new(),
     }
 }
@@ -316,6 +317,52 @@ async fn execute_user_query_insert_actually_persists_verified_via_fresh_connecti
     assert_eq!(
         readback.rows[1][1],
         CellValue::Text("parameterized insert".to_string())
+    );
+}
+
+/// A `read_only` connection sends ClickHouse's own `readonly=1` HTTP
+/// setting on every request, so the server itself rejects a write —
+/// real engine-level enforcement, not a client-side statement check
+/// this driver's SQL dialect awareness could get wrong.
+#[tokio::test]
+async fn read_only_connection_rejects_writes_but_allows_selects() {
+    let container = start_container().await;
+    let driver = connected_driver(&container).await;
+
+    driver
+        .execute_user_query(
+            "CREATE TABLE read_only_guard (id UInt32) ENGINE = MergeTree ORDER BY id",
+            None,
+            None,
+        )
+        .await
+        .expect("create table");
+
+    let mut read_only_config = config_for(&container, CLICKHOUSE_PASSWORD).await;
+    read_only_config.read_only = true;
+    let read_only_driver = ClickHouseDriver::new(read_only_config);
+    read_only_driver.connect().await.expect("connect");
+
+    let select = read_only_driver
+        .execute_user_query("SELECT id FROM read_only_guard", None, None)
+        .await
+        .expect("select still works on a read-only connection");
+    assert_eq!(select.rows.len(), 0);
+
+    read_only_driver
+        .execute_user_query("INSERT INTO read_only_guard (id) VALUES (1)", None, None)
+        .await
+        .expect_err("insert must be rejected on a read-only connection");
+
+    let fresh_driver = connected_driver(&container).await;
+    let readback = fresh_driver
+        .execute("SELECT id FROM read_only_guard")
+        .await
+        .expect("read back");
+    assert_eq!(
+        readback.rows.len(),
+        0,
+        "the rejected insert must not have persisted anything"
     );
 }
 

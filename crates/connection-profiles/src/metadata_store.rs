@@ -152,6 +152,7 @@ mod tests {
             username: "app".to_string(),
             database: Some("appdb".to_string()),
             ssl_mode: None,
+            read_only: false,
             has_password: true,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,

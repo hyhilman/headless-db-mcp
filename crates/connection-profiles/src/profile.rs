@@ -19,6 +19,8 @@ pub struct ConnectionProfile {
     pub username: String,
     pub database: Option<String>,
     pub ssl_mode: Option<SslMode>,
+    #[serde(default)]
+    pub read_only: bool,
     pub has_password: bool,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,

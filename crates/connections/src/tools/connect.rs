@@ -30,6 +30,8 @@ struct ConnectArgs {
     database: Option<String>,
     #[serde(default)]
     ssl_mode: Option<String>,
+    #[serde(default)]
+    read_only: Option<bool>,
 }
 
 fn parse_ssl_mode(raw: Option<&str>) -> Result<SslMode, McpToolError> {
@@ -123,6 +125,10 @@ impl McpTool for ConnectTool {
                     "type": "string",
                     "enum": ["disabled", "preferred", "required", "verify_ca", "verify_identity"],
                     "description": "Defaults to verify_identity when omitted."
+                },
+                "read_only": {
+                    "type": "boolean",
+                    "description": "When true, the connection rejects any write the underlying engine can be made to refuse. Only applies to the ad-hoc credential path; a profile_name connection uses the read_only value saved on that profile. Defaults to false."
                 }
             },
             "oneOf": [
@@ -145,10 +151,11 @@ impl McpTool for ConnectTool {
                     || args.password.is_some()
                     || args.database.is_some()
                     || args.ssl_mode.is_some()
+                    || args.read_only.is_some()
                 {
                     return Err(McpToolError::InvalidArguments(
                         "profile_name cannot be combined with database_type/host/port/username/\
-                         password/database/ssl_mode"
+                         password/database/ssl_mode/read_only"
                             .to_string(),
                     ));
                 }
@@ -202,6 +209,7 @@ impl McpTool for ConnectTool {
                         client_cert_path: None,
                         client_key_path: None,
                     },
+                    read_only: args.read_only.unwrap_or(false),
                     additional_fields: HashMap::new(),
                 };
                 (database_type, config)
@@ -327,6 +335,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn profile_name_combined_with_read_only_is_invalid_arguments() {
+        let manager = manager_with_mock();
+        let tool = ConnectTool::new(manager);
+
+        let err = tool
+            .call(Some(json!({
+                "profile_name": "prod",
+                "read_only": true
+            })))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, McpToolError::InvalidArguments(_)));
+    }
+
+    #[tokio::test]
     async fn profile_name_combined_with_host_is_invalid_arguments() {
         let manager = manager_with_mock();
         let tool = ConnectTool::new(manager);
@@ -396,6 +420,7 @@ mod tests {
                 password: Some(SecretStringForTest::from("secret".to_string())),
                 database: None,
                 ssl_mode: None,
+                read_only: None,
             })
             .await
             .expect("save succeeds");

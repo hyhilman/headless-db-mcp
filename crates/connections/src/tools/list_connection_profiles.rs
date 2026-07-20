@@ -113,6 +113,7 @@ mod tests {
                 password: Some(SecretString::from("hunter2".to_string())),
                 database: None,
                 ssl_mode: None,
+                read_only: Some(true),
             })
             .await
             .expect("save succeeds");
@@ -122,6 +123,7 @@ mod tests {
 
         assert_eq!(result["profiles"][0]["name"], json!("prod"));
         assert_eq!(result["profiles"][0]["has_password"], json!(true));
+        assert_eq!(result["profiles"][0]["read_only"], json!(true));
         assert!(!result.to_string().contains("hunter2"));
     }
 

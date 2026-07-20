@@ -28,7 +28,13 @@ pub fn stream_rows<'a>(driver: &'a PostgresDriver, sql: &'a str) -> RowStream<'a
         let mut guard = driver.client.write().await;
         let connected = guard.as_mut().ok_or_else(not_connected_error)?;
 
-        let txn = connected.client.transaction().await.map_err(map_query_error)?;
+        let txn = connected
+            .client
+            .build_transaction()
+            .read_only(driver.config.read_only)
+            .start()
+            .await
+            .map_err(map_query_error)?;
         let stmt = txn.prepare(sql).await.map_err(map_query_error)?;
         let portal = txn.bind(&stmt, &[]).await.map_err(map_query_error)?;
 
