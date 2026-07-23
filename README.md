@@ -129,6 +129,39 @@ can't be expressed through it the way the PostgreSQL connector does.
 Collapsing `verify_ca` into the stricter `verify_identity` behavior is
 deliberate: it never checks less than the mode asks for, only more.
 
+## Query timeouts
+
+Every connection gets two layers of query timeout, neither of which a
+caller has to opt into:
+
+- **Server-side** — right after connecting, `connect` pushes a 30s
+  timeout into the database engine itself via
+  `DatabaseDriver::apply_query_timeout` (Postgres: `SET
+  statement_timeout`; ClickHouse: `max_execution_time` on every
+  request). The engine cancels the query on its own and returns a clean
+  error; the connection stays usable for the next query. This is the
+  normal path.
+- **Client-side backstop** — `execute_query` also wraps the query call
+  itself in a 45s timeout, deliberately longer than the server-side one
+  so the engine gets the first chance to fail cleanly. The backstop only
+  trips when the connection isn't communicating at all: the same
+  packet-loss case where the engine's own timeout enforcement can't get
+  a cancellation request through either. On trip, it calls
+  `DatabaseDriver::cancel_query` (Postgres `PQcancel`, ClickHouse
+  cancel-by-query-id, Redis `CLIENT KILL`) and returns a clear
+  `isError: true` result instead of hanging indefinitely.
+
+A driver with no real `apply_query_timeout` (Redis, whose commands
+aren't long-running "statements" the same way SQL is) still gets the
+client-side backstop, since that layer lives in `execute_query`, not in
+the driver — adding it required no driver-specific code and applies to
+every current and future driver uniformly.
+
+Before this, a slow, unindexed query and a genuinely dead connection
+were indistinguishable from the caller's side: both just hung until
+something outside this server (the MCP client itself) gave up, with no
+error and no way to tell which one had happened.
+
 ## MCP protocol compliance
 
 `tools/call` responses follow the MCP spec's actual result shape:

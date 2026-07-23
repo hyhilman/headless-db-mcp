@@ -755,6 +755,30 @@ async fn cancel_query_interrupts_a_long_running_query() {
 }
 
 #[tokio::test]
+async fn apply_query_timeout_cancels_a_query_that_exceeds_it() {
+    let container = start_container().await;
+    let driver = connected_driver(&container).await;
+
+    driver
+        .apply_query_timeout(1)
+        .await
+        .expect("apply query timeout");
+
+    let start = Instant::now();
+    let result = driver.execute("SELECT sleep(3) FROM numbers(100)").await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        result.is_err(),
+        "a query exceeding max_execution_time must return an error"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "max_execution_time should cut the query off well before its natural ~300s completion, took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
 async fn supports_transactions_is_false_and_transaction_methods_return_clear_errors() {
     let container = start_container().await;
     let driver = connected_driver(&container).await;

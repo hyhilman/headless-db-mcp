@@ -10,6 +10,7 @@ pub mod error;
 pub mod limits;
 pub mod result;
 pub mod schema;
+pub mod timeouts;
 pub mod value;
 
 pub use config::{ConnectionConfig, SslConfig, SslMode};
@@ -21,4 +22,5 @@ pub use schema::{
     ColumnInfo, CreateDatabaseRequest, DatabaseMetadata, ForeignKeyInfo, IdentityKind, IndexInfo,
     ParameterStyle, StreamElement, StreamHeader, TableInfo, TableKind, TableMetadata, TriggerInfo,
 };
+pub use timeouts::QueryTimeouts;
 pub use value::CellValue;

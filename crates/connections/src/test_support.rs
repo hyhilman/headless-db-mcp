@@ -10,7 +10,8 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use db_headless_core::{
@@ -34,6 +35,9 @@ pub(crate) struct MockDriverConfig {
     pub databases: Vec<String>,
     pub schemas: Vec<String>,
     pub query_result: Option<QueryResult>,
+    pub query_delay: Option<Duration>,
+    pub cancel_query_flag: Option<Arc<AtomicBool>>,
+    pub applied_query_timeout: Option<Arc<Mutex<Option<u64>>>>,
 }
 
 impl MockDriverConfig {
@@ -78,6 +82,21 @@ impl MockDriverConfig {
             ..Self::default()
         }
     }
+
+    pub fn with_query_delay_and_cancel_flag(delay: Duration, flag: Arc<AtomicBool>) -> Self {
+        Self {
+            query_delay: Some(delay),
+            cancel_query_flag: Some(flag),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_applied_query_timeout_recorder(recorder: Arc<Mutex<Option<u64>>>) -> Self {
+        Self {
+            applied_query_timeout: Some(recorder),
+            ..Self::default()
+        }
+    }
 }
 
 pub(crate) struct MockDriver(MockDriverConfig);
@@ -108,6 +127,9 @@ impl DatabaseDriver for MockDriver {
     }
 
     async fn execute(&self, _query: &str) -> DriverResult<QueryResult> {
+        if let Some(delay) = self.0.query_delay {
+            tokio::time::sleep(delay).await;
+        }
         Ok(self
             .0
             .query_result
@@ -230,6 +252,20 @@ impl DatabaseDriver for MockDriver {
 
     fn stream_rows<'a>(&'a self, _query: &'a str) -> RowStream<'a> {
         Box::pin(stream::empty())
+    }
+
+    fn cancel_query(&self) -> DriverResult<()> {
+        if let Some(flag) = &self.0.cancel_query_flag {
+            flag.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    async fn apply_query_timeout(&self, seconds: u64) -> DriverResult<()> {
+        if let Some(recorder) = &self.0.applied_query_timeout {
+            *recorder.lock().unwrap_or_else(|p| p.into_inner()) = Some(seconds);
+        }
+        Ok(())
     }
 }
 

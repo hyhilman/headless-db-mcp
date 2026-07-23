@@ -129,10 +129,34 @@ about what's done, what's next, and what to watch out for.
   `ghcr.io/hyhilman/headless-db-mcp` on every `v*` tag, using the
   workflow's own `GITHUB_TOKEN` (no separate registry credential to
   manage) and `docker/metadata-action` to derive `{version}`,
-  `{major}.{minor}`, and `{major}` tags plus `latest`. A new GHCR
-  package defaults to private on first push even for a public repo —
-  needs a one-time manual visibility change in the package's own
-  settings after the first tag is pushed.
+  `{major}.{minor}`, and `{major}` tags plus `latest`. Verified end to
+  end with the real `v0.1.0` tag: the workflow ran, and
+  `ghcr.io/hyhilman/headless-db-mcp:0.1.0` pulled and ran successfully
+  with no `docker login` at all, so a public repo's package is public
+  from the first push here, not private-by-default as initially assumed.
+
+**Query timeouts**
+- Every connection now gets two independent timeout layers, neither
+  requiring caller opt-in. Server-side: `ConnectionManager::connect`
+  calls `DatabaseDriver::apply_query_timeout(QueryTimeouts::SERVER_SECS)`
+  (30s) right after connecting, already implemented for Postgres (`SET
+  statement_timeout`) and ClickHouse (`max_execution_time`); live-tested
+  against both with a `pg_sleep(30)` / `sleep(3)`-style query, cut off in
+  a few seconds instead of running to completion. Client-side: `execute_query`
+  wraps the query call in a `QueryTimeouts::CLIENT_BACKSTOP_SECS` (45s)
+  `tokio::time::timeout`, longer than the server-side one on purpose so
+  the engine's own timeout gets the first chance to fire cleanly; on
+  trip it calls `DatabaseDriver::cancel_query` and returns a clear
+  in-band error instead of hanging. This closes the gap surfaced by a
+  real staging investigation: a slow, unindexed `ORDER BY` query and a
+  genuinely dead VPN-tunneled connection looked identical from the
+  caller's side (both just hung until the MCP client itself gave up,
+  silently) — now the query timeout fires deterministically and reports
+  which failure mode actually happened. Redis has no real
+  `apply_query_timeout` (its commands aren't long-running "statements"
+  the same way SQL is) but still gets the client-side backstop, since
+  that layer lives in `execute_query`, not the driver — no driver-specific
+  code was needed to cover all three drivers.
 
 Full workspace (`cargo test --workspace`, `cargo clippy --workspace
 --all-targets -- -D warnings`, `cargo fmt --check`) is green as of the

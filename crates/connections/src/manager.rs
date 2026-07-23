@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use db_headless_core::{ConnectionConfig, DatabaseDriver, DriverError, DriverFactory};
+use db_headless_core::{
+    ConnectionConfig, DatabaseDriver, DriverError, DriverFactory, QueryTimeouts,
+};
 use db_headless_registry::{AttemptToken, ConnectionAttemptRegistry, SessionRegistry};
 use serde::Serialize;
 use uuid::Uuid;
@@ -149,6 +151,17 @@ impl ConnectionManager {
         if let Err(err) = driver.connect().await {
             self.attempts.invalidate(id);
             return Err(ConnectionManagerError::Driver(err));
+        }
+
+        // Best-effort: a driver that can't apply it (or doesn't support
+        // one at all, like Redis) still gets `ExecuteQueryTool`'s
+        // client-side backstop timeout, so this never blocks the connect.
+        if let Err(err) = driver.apply_query_timeout(QueryTimeouts::SERVER_SECS).await {
+            tracing::warn!(
+                %id,
+                error = %err,
+                "failed to apply the default server-side query timeout to a new connection"
+            );
         }
 
         let driver: Arc<dyn DatabaseDriver> = Arc::from(driver);
@@ -370,5 +383,23 @@ mod tests {
             .disconnect(Uuid::new_v4())
             .await
             .expect("no-op success");
+    }
+
+    #[tokio::test]
+    async fn connect_applies_the_default_server_side_query_timeout() {
+        let recorder = Arc::new(std::sync::Mutex::new(None));
+        let manager = manager_with_mock(MockDriverConfig::with_applied_query_timeout_recorder(
+            Arc::clone(&recorder),
+        ));
+
+        manager
+            .connect("Mock", sample_config())
+            .await
+            .expect("connect succeeds");
+
+        assert_eq!(
+            *recorder.lock().expect("recorder"),
+            Some(QueryTimeouts::SERVER_SECS)
+        );
     }
 }

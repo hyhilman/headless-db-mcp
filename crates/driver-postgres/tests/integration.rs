@@ -540,6 +540,30 @@ async fn cancel_query_interrupts_a_long_running_query() {
     );
 }
 
+#[tokio::test]
+async fn apply_query_timeout_cancels_a_query_that_exceeds_it() {
+    let container = start_container().await;
+    let driver = connected_driver(&container).await;
+
+    driver
+        .apply_query_timeout(1)
+        .await
+        .expect("apply query timeout");
+
+    let start = std::time::Instant::now();
+    let result = driver.execute("SELECT pg_sleep(30)").await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        result.is_err(),
+        "a query exceeding statement_timeout must return an error"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "statement_timeout should cut the query off well before its natural 30s completion, took {elapsed:?}"
+    );
+}
+
 /// The official Postgres image runs every `/docker-entrypoint-initdb.d/*`
 /// script (sourced, not executed, since the copied-in file is not
 /// marked executable) after `initdb` but before the real server starts,
