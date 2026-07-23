@@ -10,6 +10,7 @@ use crate::schema::{
     ColumnInfo, CreateDatabaseRequest, DatabaseMetadata, ForeignKeyInfo, IndexInfo, ParameterStyle,
     StreamElement, TableInfo, TableMetadata, TriggerInfo,
 };
+use crate::transport::KeepalivePosture;
 use crate::value::CellValue;
 
 pub type DriverResult<T> = Result<T, DriverError>;
@@ -155,6 +156,17 @@ pub trait DatabaseDriver: Send + Sync {
         let _ = seconds;
         Ok(())
     }
+
+    /// Declares how this driver handles the transport keepalive policy
+    /// (see `crate::transport` for why the policy exists).
+    ///
+    /// Deliberately has **no default implementation**, unlike
+    /// `apply_query_timeout` above — a silent no-op default is exactly
+    /// how a driver ships without a timeout, and keepalive must not
+    /// repeat that. This is a knowing exception to the "extend via a
+    /// new default method" guidance in this trait's doc (guardrail #8):
+    /// a default posture would defeat the method's whole purpose.
+    fn keepalive_posture(&self) -> KeepalivePosture;
 
     fn server_version(&self) -> Option<String> {
         None
@@ -315,6 +327,12 @@ mod tests {
 
         async fn switch_database(&self, _database: &str) -> DriverResult<()> {
             Ok(())
+        }
+
+        fn keepalive_posture(&self) -> KeepalivePosture {
+            KeepalivePosture::NotSupported {
+                reason: "in-memory test driver; there is no socket to tune",
+            }
         }
 
         fn stream_rows<'a>(&'a self, _query: &'a str) -> RowStream<'a> {

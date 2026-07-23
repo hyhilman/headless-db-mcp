@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use db_headless_core::{
-    ConnectionConfig, DatabaseDriver, DriverError, DriverFactory, QueryTimeouts,
+    ConnectionConfig, DatabaseDriver, DriverError, DriverFactory, KeepalivePosture, QueryTimeouts,
 };
 use db_headless_registry::{AttemptToken, ConnectionAttemptRegistry, SessionRegistry};
 use serde::Serialize;
@@ -161,6 +161,18 @@ impl ConnectionManager {
                 %id,
                 error = %err,
                 "failed to apply the default server-side query timeout to a new connection"
+            );
+        }
+
+        // Purely observational — the socket work (or the driver's
+        // reasoned inability to do it) already happened inside
+        // `connect()`. Logging here makes a `NotSupported` driver
+        // visible on every connect instead of only in its source.
+        if let KeepalivePosture::NotSupported { reason } = driver.keepalive_posture() {
+            tracing::info!(
+                %id,
+                reason,
+                "driver does not apply the transport keepalive policy"
             );
         }
 

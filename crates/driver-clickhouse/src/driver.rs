@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use db_headless_core::{
     CellValue, ColumnInfo, ConnectionConfig, CreateDatabaseRequest, DatabaseDriver,
     DatabaseMetadata, DriverError, DriverErrorKind, DriverFactory, DriverResult, ForeignKeyInfo,
-    IndexInfo, ParameterStyle, QueryResult, RowStream, TableInfo, TableMetadata,
+    IndexInfo, KeepalivePosture, ParameterStyle, QueryResult, RowStream, TableInfo, TableMetadata,
 };
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -432,6 +432,11 @@ impl DatabaseDriver for ClickHouseDriver {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(seconds);
         Ok(())
+    }
+
+    fn keepalive_posture(&self) -> KeepalivePosture {
+        // Applied in `tls::build_http_client` on every connect.
+        KeepalivePosture::Applied
     }
 
     fn server_version(&self) -> Option<String> {

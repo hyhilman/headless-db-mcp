@@ -11,6 +11,7 @@ pub mod limits;
 pub mod result;
 pub mod schema;
 pub mod timeouts;
+pub mod transport;
 pub mod value;
 
 pub use config::{ConnectionConfig, SslConfig, SslMode};
@@ -23,4 +24,5 @@ pub use schema::{
     ParameterStyle, StreamElement, StreamHeader, TableInfo, TableKind, TableMetadata, TriggerInfo,
 };
 pub use timeouts::QueryTimeouts;
+pub use transport::{KeepalivePosture, TransportKeepalive};
 pub use value::CellValue;

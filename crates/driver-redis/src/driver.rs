@@ -61,8 +61,8 @@ use tokio::sync::RwLock;
 use db_headless_core::{
     CellValue, ColumnInfo, ConnectionConfig, CreateDatabaseRequest, DatabaseDriver,
     DatabaseMetadata, DriverError, DriverErrorKind, DriverFactory, DriverResult, ForeignKeyInfo,
-    IndexInfo, ParameterStyle, QueryResult, RowStream, TableInfo, TableKind, TableMetadata,
-    TriggerInfo,
+    IndexInfo, KeepalivePosture, ParameterStyle, QueryResult, RowStream, TableInfo, TableKind,
+    TableMetadata, TriggerInfo,
 };
 
 use crate::{config, error, query, schema, stream};
@@ -355,6 +355,15 @@ impl DatabaseDriver for RedisDriver {
         });
 
         Ok(())
+    }
+
+    fn keepalive_posture(&self) -> KeepalivePosture {
+        KeepalivePosture::NotSupported {
+            reason: "redis-rs 0.27 exposes no TCP keepalive control; commands here are \
+                     sub-millisecond request/response with no silent in-flight window, and \
+                     ConnectionManager transparently reconnects a culled connection on the \
+                     next command",
+        }
     }
 
     fn parameter_style(&self) -> ParameterStyle {

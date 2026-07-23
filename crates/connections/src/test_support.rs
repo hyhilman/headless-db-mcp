@@ -17,8 +17,8 @@ use async_trait::async_trait;
 use db_headless_core::{
     CellValue, ColumnInfo, ConnectionConfig, CreateDatabaseRequest, DatabaseDriver,
     DatabaseMetadata, DriverError, DriverErrorKind, DriverFactory, DriverResult, ForeignKeyInfo,
-    IndexInfo, ParameterStyle, QueryResult, RowStream, SslConfig, TableInfo, TableKind,
-    TableMetadata,
+    IndexInfo, KeepalivePosture, ParameterStyle, QueryResult, RowStream, SslConfig, TableInfo,
+    TableKind, TableMetadata,
 };
 use futures_util::stream;
 use secrecy::SecretString;
@@ -266,6 +266,12 @@ impl DatabaseDriver for MockDriver {
             *recorder.lock().unwrap_or_else(|p| p.into_inner()) = Some(seconds);
         }
         Ok(())
+    }
+
+    fn keepalive_posture(&self) -> KeepalivePosture {
+        KeepalivePosture::NotSupported {
+            reason: "in-memory mock; there is no socket to tune",
+        }
     }
 }
 

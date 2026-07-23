@@ -32,7 +32,9 @@
 
 use std::fs;
 
-use db_headless_core::{ConnectionConfig, DriverError, DriverErrorKind, SslMode};
+use db_headless_core::{
+    ConnectionConfig, DriverError, DriverErrorKind, SslMode, TransportKeepalive,
+};
 
 pub fn resolve_scheme(config: &ConnectionConfig) -> &'static str {
     match config.ssl.mode {
@@ -51,7 +53,13 @@ pub fn resolve_base_url(config: &ConnectionConfig) -> String {
 }
 
 pub fn build_http_client(config: &ConnectionConfig) -> Result<reqwest::Client, DriverError> {
-    let mut builder = reqwest::Client::builder();
+    // See `db_headless_core::transport`: reqwest's own defaults enable
+    // keepalive at 15s idle, still slower than the idle-flow culling the
+    // policy exists to outrun.
+    let mut builder = reqwest::Client::builder()
+        .tcp_keepalive(TransportKeepalive::IDLE)
+        .tcp_keepalive_interval(TransportKeepalive::INTERVAL)
+        .tcp_keepalive_retries(TransportKeepalive::RETRIES);
 
     match config.ssl.mode {
         Some(SslMode::Disabled) => {}

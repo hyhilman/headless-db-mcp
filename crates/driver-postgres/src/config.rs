@@ -13,7 +13,7 @@
 //! (`Require`) as `VerifyIdentity`, and `crate::tls::build_connector`
 //! independently applies the same default for the verifier it builds.
 
-use db_headless_core::{ConnectionConfig, SslMode};
+use db_headless_core::{ConnectionConfig, SslMode, TransportKeepalive};
 use secrecy::ExposeSecret;
 
 pub fn build_config(config: &ConnectionConfig) -> tokio_postgres::Config {
@@ -24,7 +24,14 @@ pub fn build_config(config: &ConnectionConfig) -> tokio_postgres::Config {
         .host(&config.host)
         .port(config.port)
         .user(&config.username)
-        .ssl_mode(pg_ssl_mode);
+        .ssl_mode(pg_ssl_mode)
+        // See `db_headless_core::transport`: tokio_postgres enables
+        // keepalive by default but with a 2-hour idle threshold, far too
+        // slow for the idle-flow culling the policy exists to outrun.
+        .keepalives(true)
+        .keepalives_idle(TransportKeepalive::IDLE)
+        .keepalives_interval(TransportKeepalive::INTERVAL)
+        .keepalives_retries(TransportKeepalive::RETRIES);
 
     if let Some(password) = &config.password {
         pg_config.password(password.expose_secret());
@@ -119,6 +126,22 @@ mod tests {
                 tokio_postgres::config::SslMode::Require
             );
         }
+    }
+
+    #[test]
+    fn transport_keepalive_policy_is_applied() {
+        let config = base_config(SslConfig::default());
+        let pg_config = build_config(&config);
+        assert!(pg_config.get_keepalives());
+        assert_eq!(pg_config.get_keepalives_idle(), TransportKeepalive::IDLE);
+        assert_eq!(
+            pg_config.get_keepalives_interval(),
+            Some(TransportKeepalive::INTERVAL)
+        );
+        assert_eq!(
+            pg_config.get_keepalives_retries(),
+            Some(TransportKeepalive::RETRIES)
+        );
     }
 
     #[test]

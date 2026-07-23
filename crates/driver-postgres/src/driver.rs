@@ -31,8 +31,8 @@ use async_trait::async_trait;
 use db_headless_core::{
     CellValue, ColumnInfo, ConnectionConfig, CreateDatabaseRequest, DatabaseDriver,
     DatabaseMetadata, DriverError, DriverErrorKind, DriverFactory, DriverResult, ForeignKeyInfo,
-    IndexInfo, ParameterStyle, QueryResult, RowStream, SslMode, TableInfo, TableMetadata,
-    TriggerInfo,
+    IndexInfo, KeepalivePosture, ParameterStyle, QueryResult, RowStream, SslMode, TableInfo,
+    TableMetadata, TriggerInfo,
 };
 use tokio::sync::RwLock;
 use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
@@ -364,6 +364,11 @@ impl DatabaseDriver for PostgresDriver {
             .await
             .map_err(error::map_query_error)?;
         Ok(())
+    }
+
+    fn keepalive_posture(&self) -> KeepalivePosture {
+        // Applied in `config::build_config` on every connect.
+        KeepalivePosture::Applied
     }
 
     fn server_version(&self) -> Option<String> {
