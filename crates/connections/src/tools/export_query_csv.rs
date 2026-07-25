@@ -1,15 +1,14 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
-use db_headless_core::{CellValue, QueryResult, QueryTimeouts};
+use db_headless_core::{CellValue, QueryResult};
 use db_headless_mcp_server::{McpTool, McpToolError};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::manager::ConnectionManager;
 use crate::tools::execute_query::{to_cell_value, CellValueArg};
-use crate::tools::support::{map_manager_error, parse_arguments, parse_connection_id};
+use crate::tools::support::{parse_arguments, parse_connection_id, run_user_query};
 
 #[derive(Debug, Deserialize)]
 struct ExportQueryCsvArgs {
@@ -90,33 +89,19 @@ impl McpTool for ExportQueryCsvTool {
     async fn call(&self, arguments: Option<Value>) -> Result<Value, McpToolError> {
         let args: ExportQueryCsvArgs = parse_arguments(arguments)?;
         let connection_id = parse_connection_id(&args.connection_id)?;
-        let driver = self.manager.get(connection_id).map_err(map_manager_error)?;
 
         let parameters: Option<Vec<CellValue>> = args
             .parameters
             .map(|params| params.into_iter().map(to_cell_value).collect());
 
-        let query_future =
-            driver.execute_user_query(&args.query, args.row_cap, parameters.as_deref());
-        let backstop = Duration::from_secs(QueryTimeouts::CLIENT_BACKSTOP_SECS);
-
-        let result = match tokio::time::timeout(backstop, query_future).await {
-            Ok(query_result) => {
-                query_result.map_err(|err| McpToolError::Failed(err.to_string()))?
-            }
-            Err(_elapsed) => {
-                if let Err(err) = driver.cancel_query() {
-                    tracing::warn!(
-                        error = %err,
-                        "failed to cancel a query that exceeded the client-side backstop timeout"
-                    );
-                }
-                return Err(McpToolError::Failed(format!(
-                    "query exceeded the {}s client-side timeout and was cancelled; this connection's link may be unstable, or the query itself may be missing an index",
-                    QueryTimeouts::CLIENT_BACKSTOP_SECS
-                )));
-            }
-        };
+        let result = run_user_query(
+            &self.manager,
+            connection_id,
+            &args.query,
+            parameters.as_deref(),
+            args.row_cap,
+        )
+        .await?;
 
         let csv = render_csv(&result, args.include_header);
 

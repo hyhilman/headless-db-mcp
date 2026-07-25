@@ -1,10 +1,13 @@
+use std::time::Duration;
+
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use uuid::Uuid;
 
+use db_headless_core::{CellValue, QueryResult, QueryTimeouts};
 use db_headless_mcp_server::McpToolError;
 
-use crate::manager::ConnectionManagerError;
+use crate::manager::{ConnectionManager, ConnectionManagerError};
 
 /// Deserializes a tool's `arguments` into its typed argument struct,
 /// mapping both "arguments missing entirely" and "arguments present but
@@ -23,6 +26,44 @@ pub(crate) fn parse_arguments<T: DeserializeOwned>(
 pub(crate) fn parse_connection_id(raw: &str) -> Result<Uuid, McpToolError> {
     Uuid::parse_str(raw)
         .map_err(|err| McpToolError::InvalidArguments(format!("invalid connection_id: {err}")))
+}
+
+/// Runs a user-supplied query on a live connection, wrapped in the same
+/// client-side backstop timeout and cancellation every query-running tool
+/// shares (`execute_query`, `export_query_csv`, `export_query_jsonl`).
+///
+/// The server-side engine timeout (`apply_query_timeout`, set at connect)
+/// is the normal path; this backstop only trips when the connection is not
+/// communicating at all, at which point it calls `cancel_query` out of band
+/// and returns a clear `Failed` rather than hanging. Factored here so the
+/// three tools that run a query cannot drift apart on this behavior.
+pub(crate) async fn run_user_query(
+    manager: &ConnectionManager,
+    connection_id: Uuid,
+    query: &str,
+    parameters: Option<&[CellValue]>,
+    row_cap: Option<usize>,
+) -> Result<QueryResult, McpToolError> {
+    let driver = manager.get(connection_id).map_err(map_manager_error)?;
+
+    let query_future = driver.execute_user_query(query, row_cap, parameters);
+    let backstop = Duration::from_secs(QueryTimeouts::CLIENT_BACKSTOP_SECS);
+
+    match tokio::time::timeout(backstop, query_future).await {
+        Ok(query_result) => query_result.map_err(|err| McpToolError::Failed(err.to_string())),
+        Err(_elapsed) => {
+            if let Err(err) = driver.cancel_query() {
+                tracing::warn!(
+                    error = %err,
+                    "failed to cancel a query that exceeded the client-side backstop timeout"
+                );
+            }
+            Err(McpToolError::Failed(format!(
+                "query exceeded the {}s client-side timeout and was cancelled; this connection's link may be unstable, or the query itself may be missing an index",
+                QueryTimeouts::CLIENT_BACKSTOP_SECS
+            )))
+        }
+    }
 }
 
 /// Maps a `ConnectionManagerError` onto the right `McpToolError` variant.
