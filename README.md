@@ -24,7 +24,7 @@ See `crates/`:
   implemented `DatabaseDriver`s.
 - `connections` — `ConnectionManager` (driver-agnostic connection
   lifecycle) and the MCP tools that expose it (`connect`,
-  `execute_query`, `list_tables`, ...).
+  `execute_query`, `export_query_csv`, `list_tables`, ...).
 - `connection-profiles` — named, persisted connection credentials (see
   "Credential storage" below).
 - `server` — binary crate wiring all of the above into a running MCP
@@ -177,6 +177,38 @@ calling a tool name that isn't registered is a JSON-RPC-level error
 Returning the bare tool value as `result` (this server's original shape)
 is valid JSON-RPC but renders as nothing in a real MCP client, including
 Claude Code, since every client reads `result.content`.
+
+## Exporting records as CSV
+
+`export_query_csv` runs a query exactly like `execute_query` — same
+`connection_id`/`query`/`parameters`/`row_cap` arguments, same read-only
+enforcement, same server-side timeout and client-side backstop with
+query cancellation — but renders the result set as CSV text instead of a
+JSON array of cells, which is what a caller actually wants when the goal
+is "dump these records" (paste into a spreadsheet, append to a file):
+
+```json
+{
+  "csv": "id,name\r\n1,Alice\r\n2,\"Bob, Jr.\"\r\n",
+  "row_count": 2,
+  "columns": ["id", "name"],
+  "truncated": false
+}
+```
+
+- The CSV is RFC 4180: `\r\n` record separators, and a field is quoted
+  (with any `"` doubled) only when it contains a `"`, `,`, `\r`, or `\n`.
+- A SQL `NULL` becomes an empty field. Binary (`bytea`/blob) cells render
+  as `\x`-prefixed lowercase hex, matching PostgreSQL's own `bytea`
+  output, since CSV has no binary literal.
+- `include_header` (default `true`) toggles the leading column-name row —
+  set it `false` to dump only records, e.g. when appending to a file that
+  already has the header.
+- The hard server-side row cap (guardrail #7,
+  `core::RowLimits::EMERGENCY_MAX`) still applies. `truncated` is `true`
+  when the dump was clipped by it, so a partial export is never mistaken
+  for a complete one — re-run with a narrower `WHERE`/`LIMIT` for the
+  rest.
 
 ## Running with Docker
 

@@ -19,6 +19,7 @@ mod tools;
 pub use manager::{ConnectionManager, ConnectionManagerError, ConnectionSummary};
 pub use tools::{
     CellValueArg, ConnectTool, DeleteConnectionProfileTool, DescribeTableTool, DisconnectTool,
-    ExecuteQueryTool, GetConnectionStatusTool, ListConnectionProfilesTool, ListConnectionsTool,
-    ListDatabasesTool, ListSchemasTool, ListTablesTool, SaveConnectionProfileTool,
+    ExecuteQueryTool, ExportQueryCsvTool, GetConnectionStatusTool, ListConnectionProfilesTool,
+    ListConnectionsTool, ListDatabasesTool, ListSchemasTool, ListTablesTool,
+    SaveConnectionProfileTool,
 };

@@ -22,7 +22,7 @@ use crate::tools::support::{map_manager_error, parse_arguments, parse_connection
 /// `{"base64": "..."}`) once a driver actually needs it.
 pub type CellValueArg = Option<String>;
 
-fn to_cell_value(arg: CellValueArg) -> CellValue {
+pub(crate) fn to_cell_value(arg: CellValueArg) -> CellValue {
     match arg {
         Some(text) => CellValue::Text(text),
         None => CellValue::Null,
