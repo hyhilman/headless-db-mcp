@@ -24,7 +24,7 @@ See `crates/`:
   implemented `DatabaseDriver`s.
 - `connections` — `ConnectionManager` (driver-agnostic connection
   lifecycle) and the MCP tools that expose it (`connect`,
-  `execute_query`, `list_tables`, ...).
+  `execute_query`, `export_query_jsonl`, `list_tables`, ...).
 - `connection-profiles` — named, persisted connection credentials (see
   "Credential storage" below).
 - `server` — binary crate wiring all of the above into a running MCP
@@ -177,6 +177,50 @@ calling a tool name that isn't registered is a JSON-RPC-level error
 Returning the bare tool value as `result` (this server's original shape)
 is valid JSON-RPC but renders as nothing in a real MCP client, including
 Claude Code, since every client reads `result.content`.
+
+## Exporting records as JSON Lines
+
+`export_query_jsonl` dumps a query's result set as JSON Lines (one JSON
+object per row, newline-separated) instead of the JSON-array-of-cells
+shape `execute_query` returns — a file-ready format for exporting records.
+It runs the query on the exact same path as `execute_query` — same
+`connection_id`/`query`/`parameters`/`row_cap` arguments, same read-only
+enforcement, same server-side timeout and client-side backstop with query
+cancellation — differing only in how the rows are rendered.
+
+Crucially, it preserves types. Every cell in this server is carried as
+text with its real type in `column_type_names`; JSON Lines renders each
+value as a native JSON number, boolean, string, or `null` (so the number
+`1` and the string `"1"` stay distinct, and SQL `NULL` stays `null`),
+using that type name to decide which.
+
+```json
+{
+  "jsonl": "{\"id\":1,\"active\":true,\"balance\":12.5,\"note\":null}\n{\"id\":2,\"active\":false,\"balance\":null,\"note\":\"hi\"}\n",
+  "row_count": 2,
+  "columns": ["id", "active", "balance", "note"],
+  "column_type_names": ["int4", "bool", "float8", "text"],
+  "truncated": false
+}
+```
+
+- Integer types render as JSON integers, float types as JSON numbers,
+  `bool` as `true`/`false`, SQL `NULL` as `null`; everything else stays a
+  string.
+- `numeric`/`decimal` deliberately stay strings — a JSON `float` would
+  silently lose their arbitrary precision.
+- Typing is guarded by an actual parse: if a value classified as numeric
+  does not parse (or the driver reports an unfamiliar type name), it
+  degrades to a string rather than to wrong data. ClickHouse
+  `Nullable(...)`/`LowCardinality(...)` wrappers are unwrapped first.
+- Binary (`bytea`/blob) cells render as `\x`-prefixed lowercase hex
+  (JSON has no binary literal). The envelope echoes `columns` and
+  `column_type_names` so the full schema travels with the dump.
+- The hard server-side row cap (guardrail #7,
+  `core::RowLimits::EMERGENCY_MAX`) still applies. `truncated` is `true`
+  when the dump was clipped by it, so a partial export is never mistaken
+  for a complete one — re-run with a narrower `WHERE`/`LIMIT` for the
+  rest.
 
 ## Running with Docker
 

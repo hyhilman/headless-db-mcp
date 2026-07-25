@@ -56,8 +56,9 @@ use std::sync::Arc;
 use db_headless_connection_profiles::ConnectionProfileManager;
 use db_headless_connections::{
     ConnectTool, ConnectionManager, DeleteConnectionProfileTool, DescribeTableTool, DisconnectTool,
-    ExecuteQueryTool, GetConnectionStatusTool, ListConnectionProfilesTool, ListConnectionsTool,
-    ListDatabasesTool, ListSchemasTool, ListTablesTool, SaveConnectionProfileTool,
+    ExecuteQueryTool, ExportQueryJsonlTool, GetConnectionStatusTool, ListConnectionProfilesTool,
+    ListConnectionsTool, ListDatabasesTool, ListSchemasTool, ListTablesTool,
+    SaveConnectionProfileTool,
 };
 use db_headless_driver_clickhouse::ClickHouseDriverFactory;
 use db_headless_driver_postgres::PostgresDriverFactory;
@@ -140,6 +141,9 @@ fn build_session(profiles: Option<Arc<ConnectionProfileManager>>) -> McpSession 
 
     registry.register(Arc::new(DisconnectTool::new(connection_manager.clone())));
     registry.register(Arc::new(ExecuteQueryTool::new(connection_manager.clone())));
+    registry.register(Arc::new(ExportQueryJsonlTool::new(
+        connection_manager.clone(),
+    )));
     registry.register(Arc::new(ListDatabasesTool::new(connection_manager.clone())));
     registry.register(Arc::new(ListSchemasTool::new(connection_manager.clone())));
     registry.register(Arc::new(ListTablesTool::new(connection_manager.clone())));

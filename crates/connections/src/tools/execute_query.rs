@@ -1,14 +1,13 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
-use db_headless_core::{CellValue, QueryTimeouts};
+use db_headless_core::CellValue;
 use db_headless_mcp_server::{McpTool, McpToolError};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::manager::ConnectionManager;
-use crate::tools::support::{map_manager_error, parse_arguments, parse_connection_id};
+use crate::tools::support::{parse_arguments, parse_connection_id, run_user_query};
 
 /// JSON-friendly representation of a single bound query parameter.
 ///
@@ -22,7 +21,7 @@ use crate::tools::support::{map_manager_error, parse_arguments, parse_connection
 /// `{"base64": "..."}`) once a driver actually needs it.
 pub type CellValueArg = Option<String>;
 
-fn to_cell_value(arg: CellValueArg) -> CellValue {
+pub(crate) fn to_cell_value(arg: CellValueArg) -> CellValue {
     match arg {
         Some(text) => CellValue::Text(text),
         None => CellValue::Null,
@@ -80,33 +79,19 @@ impl McpTool for ExecuteQueryTool {
     async fn call(&self, arguments: Option<Value>) -> Result<Value, McpToolError> {
         let args: ExecuteQueryArgs = parse_arguments(arguments)?;
         let connection_id = parse_connection_id(&args.connection_id)?;
-        let driver = self.manager.get(connection_id).map_err(map_manager_error)?;
 
         let parameters: Option<Vec<CellValue>> = args
             .parameters
             .map(|params| params.into_iter().map(to_cell_value).collect());
 
-        let query_future =
-            driver.execute_user_query(&args.query, args.row_cap, parameters.as_deref());
-        let backstop = Duration::from_secs(QueryTimeouts::CLIENT_BACKSTOP_SECS);
-
-        let result = match tokio::time::timeout(backstop, query_future).await {
-            Ok(query_result) => {
-                query_result.map_err(|err| McpToolError::Failed(err.to_string()))?
-            }
-            Err(_elapsed) => {
-                if let Err(err) = driver.cancel_query() {
-                    tracing::warn!(
-                        error = %err,
-                        "failed to cancel a query that exceeded the client-side backstop timeout"
-                    );
-                }
-                return Err(McpToolError::Failed(format!(
-                    "query exceeded the {}s client-side timeout and was cancelled; this connection's link may be unstable, or the query itself may be missing an index",
-                    QueryTimeouts::CLIENT_BACKSTOP_SECS
-                )));
-            }
-        };
+        let result = run_user_query(
+            &self.manager,
+            connection_id,
+            &args.query,
+            parameters.as_deref(),
+            args.row_cap,
+        )
+        .await?;
 
         serde_json::to_value(result)
             .map_err(|err| McpToolError::Failed(format!("failed to serialize query result: {err}")))
@@ -115,7 +100,9 @@ impl McpTool for ExecuteQueryTool {
 
 #[cfg(test)]
 mod tests {
-    use db_headless_core::QueryResult;
+    use std::time::Duration;
+
+    use db_headless_core::{QueryResult, QueryTimeouts};
 
     use super::*;
     use crate::test_support::{sample_config, MockDriverConfig, MockFactory};
