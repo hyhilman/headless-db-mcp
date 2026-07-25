@@ -17,6 +17,10 @@ members = [
 ]
 
 [workspace.package]
+# Single source of truth for the whole workspace's version. Every crate
+# sets `version.workspace = true`, so a release is a one-line bump here
+# (kept in lockstep with the `v*` git tag the Docker publish CI fires on).
+version = "0.1.3"
 edition = "2021"
 license = "MIT"
 rust-version = "1.90"
