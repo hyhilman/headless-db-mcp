@@ -30,7 +30,7 @@ pub(crate) fn parse_connection_id(raw: &str) -> Result<Uuid, McpToolError> {
 
 /// Runs a user-supplied query on a live connection, wrapped in the same
 /// client-side backstop timeout and cancellation every query-running tool
-/// shares (`execute_query`, `export_query_csv`, `export_query_jsonl`).
+/// shares (`execute_query`, `export_query_jsonl`).
 ///
 /// The server-side engine timeout (`apply_query_timeout`, set at connect)
 /// is the normal path; this backstop only trips when the connection is not

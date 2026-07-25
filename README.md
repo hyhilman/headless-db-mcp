@@ -24,8 +24,7 @@ See `crates/`:
   implemented `DatabaseDriver`s.
 - `connections` — `ConnectionManager` (driver-agnostic connection
   lifecycle) and the MCP tools that expose it (`connect`,
-  `execute_query`, `export_query_csv`, `export_query_jsonl`,
-  `list_tables`, ...).
+  `execute_query`, `export_query_jsonl`, `list_tables`, ...).
 - `connection-profiles` — named, persisted connection credentials (see
   "Credential storage" below).
 - `server` — binary crate wiring all of the above into a running MCP
@@ -179,25 +178,21 @@ Returning the bare tool value as `result` (this server's original shape)
 is valid JSON-RPC but renders as nothing in a real MCP client, including
 Claude Code, since every client reads `result.content`.
 
-## Exporting records
+## Exporting records as JSON Lines
 
-Two tools dump a query's result set in a file-ready format instead of the
-JSON-array-of-cells shape `execute_query` returns. Both run the query on
-the exact same path as `execute_query` — same
+`export_query_jsonl` dumps a query's result set as JSON Lines (one JSON
+object per row, newline-separated) instead of the JSON-array-of-cells
+shape `execute_query` returns — a file-ready format for exporting records.
+It runs the query on the exact same path as `execute_query` — same
 `connection_id`/`query`/`parameters`/`row_cap` arguments, same read-only
 enforcement, same server-side timeout and client-side backstop with query
-cancellation — and both surface `truncated`, which is `true` when the hard
-server-side row cap (guardrail #7, `core::RowLimits::EMERGENCY_MAX`)
-clipped the dump, so a partial export is never mistaken for a complete one
-(re-run with a narrower `WHERE`/`LIMIT` for the rest). They differ only in
-how the rows are rendered.
+cancellation — differing only in how the rows are rendered.
 
-### `export_query_jsonl` (type-preserving)
-
-JSON Lines — one JSON object per row, newline-separated. Prefer this when
-types matter: unlike CSV, it keeps numbers, booleans, and `null` distinct
-from the strings that merely look like them, using the query's
-`column_type_names` to decide.
+Crucially, it preserves types. Every cell in this server is carried as
+text with its real type in `column_type_names`; JSON Lines renders each
+value as a native JSON number, boolean, string, or `null` (so the number
+`1` and the string `"1"` stay distinct, and SQL `NULL` stays `null`),
+using that type name to decide which.
 
 ```json
 {
@@ -221,30 +216,11 @@ from the strings that merely look like them, using the query's
 - Binary (`bytea`/blob) cells render as `\x`-prefixed lowercase hex
   (JSON has no binary literal). The envelope echoes `columns` and
   `column_type_names` so the full schema travels with the dump.
-
-### `export_query_csv`
-
-CSV, for spreadsheets and tools that expect it. Note that CSV flattens
-every cell to text — the number `1` and the string `"1"` come out
-identical, and `NULL` blurs into an empty field; reach for
-`export_query_jsonl` when that distinction matters.
-
-```json
-{
-  "csv": "id,name\r\n1,Alice\r\n2,\"Bob, Jr.\"\r\n",
-  "row_count": 2,
-  "columns": ["id", "name"],
-  "truncated": false
-}
-```
-
-- The CSV is RFC 4180: `\r\n` record separators, and a field is quoted
-  (with any `"` doubled) only when it contains a `"`, `,`, `\r`, or `\n`.
-- A SQL `NULL` becomes an empty field. Binary cells render as
-  `\x`-prefixed lowercase hex, matching PostgreSQL's own `bytea` output.
-- `include_header` (default `true`) toggles the leading column-name row —
-  set it `false` to dump only records, e.g. when appending to a file that
-  already has the header.
+- The hard server-side row cap (guardrail #7,
+  `core::RowLimits::EMERGENCY_MAX`) still applies. `truncated` is `true`
+  when the dump was clipped by it, so a partial export is never mistaken
+  for a complete one — re-run with a narrower `WHERE`/`LIMIT` for the
+  rest.
 
 ## Running with Docker
 

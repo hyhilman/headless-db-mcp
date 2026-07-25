@@ -22,14 +22,14 @@ struct ExportQueryJsonlArgs {
 }
 
 /// Dumps a query's result set as JSON Lines (one JSON object per row,
-/// newline-separated), the type-preserving counterpart to
-/// [`ExportQueryCsvTool`](crate::tools::ExportQueryCsvTool).
+/// newline-separated) — a file-ready export format that preserves types.
 ///
-/// CSV flattens every cell to a string, so a number, a boolean, and the
-/// text `"1"` all come out indistinguishable, and SQL `NULL` blurs into an
-/// empty field. JSON Lines keeps those apart: each value is rendered as a
-/// native JSON number, boolean, string, or `null`, keyed by column name,
-/// using the query's `column_type_names` to decide which. The envelope also
+/// Every cell in this server is carried as text with its real type in
+/// `column_type_names`, so a flat text format (like CSV) would render a
+/// number, a boolean, and the text `"1"` indistinguishably and blur SQL
+/// `NULL` into an empty field. JSON Lines keeps those apart: each value is
+/// rendered as a native JSON number, boolean, string, or `null`, keyed by
+/// column name, using that type name to decide which. The envelope also
 /// echoes `columns` and `column_type_names` so the full schema travels with
 /// the dump.
 ///
@@ -271,8 +271,8 @@ fn parse_bool(text: &str) -> Option<bool> {
     }
 }
 
-/// `\x`-prefixed lowercase hex, matching the CSV export tool and
-/// PostgreSQL's own `bytea` output — JSON has no binary literal.
+/// `\x`-prefixed lowercase hex, matching PostgreSQL's own `bytea` output —
+/// JSON has no binary literal.
 fn hex_encode(bytes: &[u8]) -> String {
     let mut hex = String::with_capacity(2 + bytes.len() * 2);
     hex.push_str("\\x");
