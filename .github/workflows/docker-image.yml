@@ -1,0 +1,67 @@
+name: Docker Image
+
+# Reusable build-and-push of the GHCR image. Called from two places:
+#   - docker-publish.yml, when a v* tag is pushed by a human;
+#   - release.yml, right after it auto-tags a merge to main (a tag pushed
+#     by GITHUB_TOKEN cannot trigger the tag-push workflow, so release.yml
+#     calls this directly instead).
+# Keeping the build in one place means those two entry points can never
+# drift apart.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref (the tag) to check out and build from.
+        required: true
+        type: string
+      version:
+        description: Version for the image tags, e.g. v0.1.3.
+        required: true
+        type: string
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # `value` feeds the version explicitly rather than reading it from
+          # the git ref: when this workflow is called from release.yml the
+          # caller's ref is main, not the tag, so ref-derived semver would be
+          # wrong.
+          tags: |
+            type=semver,pattern={{version}},value=${{ inputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.version }}
+            type=semver,pattern={{major}},value=${{ inputs.version }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
